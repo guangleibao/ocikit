@@ -2,6 +2,8 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import os
+import signal
+import time
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -68,6 +70,31 @@ class EndpointTests(unittest.TestCase):
     def test_dry_run_directives(self):
         for endpoint in ('private', 'public'):
             self.assertIn('discover ' + endpoint + ' endpoint', self.dry_run(['--endpoint', endpoint]))
+
+    def test_default_duration_is_unlimited_and_timed_runs_remain_available(self):
+        self.assertIn('Duration: unlimited (until Ctrl-C)', self.dry_run([]))
+        self.assertIn('Duration: 120s', self.dry_run(['--duration', '120']))
+
+    def test_continuous_run_can_be_interrupted(self):
+        args = SimpleNamespace(duration=None, rate=0, max_messages=None, workers=1,
+                               report_interval=5, json_report=None, stream_id='stream',
+                               stream_name='events', message_size=1024)
+        old_handler = signal.getsignal(signal.SIGINT)
+        def interrupt_worker(oci, client, args, allocator, metrics, stop, run_id, worker_id):
+            self.assertEqual(allocator.deadline, float('inf'))
+            self.assertIsNotNone(allocator.claim())
+            signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+            self.assertTrue(stop.is_set())
+        with patch.dict(PRODUCER, {'worker': interrupt_worker}), redirect_stdout(io.StringIO()):
+            result = PRODUCER['stress'](self.oci, [Mock()], args, 100, 'run')
+        self.assertEqual(result, 130)
+        self.assertIs(signal.getsignal(signal.SIGINT), old_handler)
+
+    def test_message_cap_still_applies_without_duration(self):
+        allocator = PRODUCER['Allocator'](float('inf'), 2, 0, 3, time.monotonic())
+        self.assertEqual(allocator.claim()[:2], (0, 2))
+        self.assertEqual(allocator.claim()[:2], (2, 1))
+        self.assertIsNone(allocator.claim())
 
     def test_environment_directive_and_cli_override(self):
         env = {'OCI_STREAM_ENDPOINT': 'private'}

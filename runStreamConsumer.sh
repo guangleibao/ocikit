@@ -48,7 +48,9 @@ start at TRIM_HORIZON by default. Existing groups resume committed offsets;
 Each batch is processed (counted and printed by default) before an explicit offset
 commit. Delivery is at least once: a failure can cause messages to be read again.
 SDK calls are not retried automatically; errors stop the run with exit code 1.
-A duration limits new reads; in-flight reads and commits drain to their timeouts.
+By default, keep waiting for messages until Ctrl-C. An explicit --duration limits
+new reads; in-flight reads and commits drain to their timeouts. --max-messages
+also stops the run when the requested number of messages has been consumed.
 Ctrl-C/SIGTERM drains fetched batches and exits 130. Metrics are per this process,
 not the entire consumer group. Messages are printed as JSON lines to stdout;
 Keys remain base64; values show the first 10 base64 characters followed by "...".
@@ -312,7 +314,7 @@ def consume(oci, clients, args, run_id):
     for signum in (signal.SIGINT, signal.SIGTERM):
         old_signals[signum] = signal.signal(signum, interrupt)
     started = time.monotonic()
-    deadline = started + args.duration
+    deadline = started + args.duration if args.duration is not None else float('inf')
     prefix = args.instance_name or run_id
     try:
         with ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix='stream-consumer') as pool:
@@ -425,7 +427,8 @@ def main(argv=None):
                         metavar='private|public|HTTPS_URL', help='endpoint type or HTTPS messages URL (default: OCI_STREAM_ENDPOINT, otherwise discover)')
     parser.add_argument('--region', default=os.getenv('OCI_REGION') or None,
                         help='stream region (default: OCI_REGION, otherwise instance region)')
-    parser.add_argument('--duration', type=positive_float, default=60, help='seconds to start new reads (default: 60)')
+    parser.add_argument('--duration', type=positive_float,
+                        help='seconds to start new reads (default: run continuously until Ctrl-C)')
     parser.add_argument('--workers', type=positive_int, default=2, help='consumer group instances sharing the rate cap (default: 2; maximum: 128)')
     parser.add_argument('--batch-size', type=positive_int, default=1000, help='maximum messages/read (default: 1000; maximum: 10000)')
     parser.add_argument('--request-rate', type=positive_float, default=2,
@@ -487,7 +490,8 @@ def main(argv=None):
             print('Kafka bootstrap: ' + (args.kafka_bootstrap_servers or 'discover from stream pool Kafka settings'))
         print(f'Group: {args.group_name}; instance prefix: {args.instance_name or "random UUID"}; workers: {args.workers}')
         print(f'New group position: {args.cursor_type}; time: {args.time}; existing group: resume committed offsets')
-        print(f'Duration: {args.duration:g}s; batch size: {args.batch_size}; maximum consumed: {args.max_messages or "duration-limited"}')
+        duration_plan = f'{args.duration:g}s' if args.duration is not None else 'unlimited (until Ctrl-C)'
+        print(f'Duration: {duration_plan}; batch size: {args.batch_size}; maximum consumed: {args.max_messages or "unlimited"}')
         print(f'Pacing: {args.request_rate:g} application calls/sec shared by all workers, including commits')
         if args.kafka:
             print('Kafka background fetches are separate; prefetch is limited with 1-second queue/error backoff')

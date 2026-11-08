@@ -49,7 +49,9 @@ Payloads contain random bytes, reused within a worker. Unique keys spread load
 across partitions; --key deliberately puts the load on one partition. A batch
 stays below 1,000,000 decoded key+value bytes. No automatic publish retries or
 resends are performed. Timeouts/5xx are uncertain delivery, not proven rejection.
-A duration limits new requests; in-flight requests drain up to their timeouts.
+By default, keep producing until Ctrl-C. An explicit --duration limits new
+requests; in-flight requests drain up to their timeouts. --max-messages also
+stops the run when the requested number of messages has been attempted.
 Exit: 0 all acknowledged, 1 rejected/uncertain/fatal errors, 130 interrupted.
 """
 import argparse
@@ -257,7 +259,8 @@ def stress(oci, clients, args, batch_size, run_id):
     for signum in (signal.SIGINT, signal.SIGTERM):
         old_signals[signum] = signal.signal(signum, interrupt)
     started = time.monotonic()
-    allocator = Allocator(started + args.duration, batch_size, args.rate, args.max_messages, started)
+    deadline = started + args.duration if args.duration is not None else float('inf')
+    allocator = Allocator(deadline, batch_size, args.rate, args.max_messages, started)
     previous, previous_time = metrics.snapshot(), started
     try:
         with ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix='stream-producer') as pool:
@@ -362,7 +365,8 @@ def main(argv=None):
                              '(default: OCI_STREAM_ENDPOINT in .env, otherwise discover configured endpoint)')
     parser.add_argument('--region', default=os.getenv('OCI_REGION') or None,
                         help='stream region (default: OCI_REGION in .env, otherwise instance region)')
-    parser.add_argument('--duration', type=positive_float, default=60, help='seconds to start new requests (default: 60)')
+    parser.add_argument('--duration', type=positive_float,
+                        help='seconds to start new requests (default: run continuously until Ctrl-C)')
     parser.add_argument('--workers', type=positive_int, default=4, help='concurrent SDK clients (default: 4)')
     parser.add_argument('--batch-size', type=positive_int, default=100, help='maximum messages/request; shrinks to fit 1 MB (default: 100)')
     parser.add_argument('--message-size', type=positive_int, default=1024, help='decoded payload bytes/message (default: 1024)')
@@ -377,6 +381,7 @@ def main(argv=None):
     parser.add_argument('--debug', action='store_true', help='enable SDK debug logging')
     parser.add_argument('--dry-run', action='store_true', help='show plan without importing OCI, authenticating or sending requests')
     args = parser.parse_args(argv)
+    duration_plan = f'{args.duration:g}s' if args.duration is not None else 'unlimited (until Ctrl-C)'
     if not args.stream_name or not args.stream_name.strip():
         parser.error('set OCI_STREAM_NAME in .env or provide a stream name')
     args.compartment_id = (os.getenv('OCI_COMPARTMENT_ID') or '').strip()
@@ -408,8 +413,8 @@ def main(argv=None):
         if args.endpoint in ('private', 'public'):
             endpoint_plan = f'discover {args.endpoint} endpoint using stream pool type and StreamAdminClient.get_stream'
         print(f'Endpoint: {endpoint_plan}')
-        print(f'Duration: {args.duration:g}s; workers: {args.workers}; effective batch size: {batch_size}; payload: {args.message_size} bytes')
-        print(f'Rate: {args.rate:g} messages/sec (0=unlimited); maximum attempted: {args.max_messages or "duration-limited"}')
+        print(f'Duration: {duration_plan}; workers: {args.workers}; effective batch size: {batch_size}; payload: {args.message_size} bytes')
+        print(f'Rate: {args.rate:g} messages/sec (0=unlimited); maximum attempted: {args.max_messages or "unlimited"}')
         print(f'Decoded batch budget: <= {batch_size * per_message:,} bytes; keys: {"fixed/single partition" if args.key is not None else "unique/distributed"}')
         print('No SDK import, instance metadata requests, authentication, publication or report writes.')
         return 0
@@ -442,7 +447,7 @@ def main(argv=None):
         if not endpoint:
             raise RuntimeError('Stream has no messages endpoint; specify --endpoint.')
         print(f'Messages endpoint: {endpoint}\nWorkers: {args.workers}; batch: {batch_size}; payload: {args.message_size} bytes; '
-              f'duration: {args.duration:g}s; rate: {args.rate:g} msg/s (0=unlimited)', flush=True)
+              f'duration: {duration_plan}; rate: {args.rate:g} msg/s (0=unlimited)', flush=True)
         clients = []
         try:
             for _ in range(args.workers):

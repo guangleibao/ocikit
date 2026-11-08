@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import os
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 import threading
@@ -253,9 +254,41 @@ class ConsumerTests(unittest.TestCase):
         self.assertIn('workers: 2', output)
         self.assertIn('batch size: 1000', output)
         self.assertIn('Pacing: 2 application calls/sec shared by all workers, including commits', output)
+        self.assertIn('Duration: unlimited (until Ctrl-C)', output)
+
+    def test_explicit_duration_in_dry_run(self):
+        output = self.cli(['events', '--group-name', 'group', '--dry-run', '--duration', '120'])
+        self.assertIn('Duration: 120s', output)
+
+    def test_continuous_run_has_no_deadline_and_drains_on_interrupt(self):
+        args = SimpleNamespace(max_messages=None, request_rate=2, duration=None, workers=1,
+                               instance_name=None, kafka=False, report_interval=5, json_report=None)
+        previous_handler = signal.getsignal(signal.SIGINT)
+        def idle_worker(oci, client, args, state, stop, deadline, instance_name, output_lock):
+            self.assertEqual(deadline, float('inf'))
+            self.assertFalse(stop.is_set())
+            signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+            self.assertTrue(stop.is_set())
+        with patch.dict(CONSUMER, {'worker': idle_worker}), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = CONSUMER['consume'](self.oci, [self.client], args, 'run')
+        self.assertEqual(result, 130)
+        self.assertIs(signal.getsignal(signal.SIGINT), previous_handler)
+
+    def test_explicit_duration_stops_empty_stream(self):
+        args = SimpleNamespace(max_messages=None, request_rate=10000, duration=.03, workers=1,
+                               instance_name=None, kafka=False, report_interval=5, json_report=None,
+                               group_name='group', stream_id='stream', cursor_type='TRIM_HORIZON',
+                               time=None, batch_size=1000, print_messages=False, poll_interval=.001)
+        self.client.get_messages.return_value.data = []
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = CONSUMER['consume'](self.oci, [self.client], args, 'run')
+        self.assertEqual(result, 0)
+        self.assertGreater(self.client.get_messages.call_count, 0)
+        self.client.consumer_commit.assert_not_called()
 
     def test_invalid_parameters(self):
         cases = [[], ['--batch-size', '10001'], ['--workers', '129'], ['--poll-interval', '11'],
+                 ['--duration', '0'], ['--duration', '-1'],
                  ['--request-rate', '0'], ['--request-rate', 'nan'], ['--request-rate', 'inf'],
                  ['--cursor-type', 'AT_TIME'], ['--time', '2026-11-09T00:00:00Z'],
                  ['--cursor-type', 'AT_TIME', '--time', '2026-11-09T00:00:00'], ['--endpoint', 'bad']]
