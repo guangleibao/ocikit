@@ -12,6 +12,8 @@ fi
 
 if [ -f .venv/bin/activate ]; then
     . ./.venv/bin/activate
+elif [ -z "${VIRTUAL_ENV:-}" ] && [ -f "$OCIKIT_DIR/.venv/bin/activate" ]; then
+    . "$OCIKIT_DIR/.venv/bin/activate"
 fi
 if [ -n "${VIRTUAL_ENV:-}" ]; then
     if [ ! -x "$VIRTUAL_ENV/bin/python" ]; then
@@ -29,7 +31,7 @@ fi
 exec "$@" <<'OCI_STREAM_CONSUMER_PY'
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["oci>=2.189.0,<3"]
+# dependencies = ["oci>=2.189.0,<3", "confluent-kafka>=2.12,<3"]
 # ///
 """Consume an OCI stream using a consumer group and instance principals.
 
@@ -52,6 +54,21 @@ not the entire consumer group. Messages are printed as JSON lines to stdout;
 Keys remain base64; values show the first 10 base64 characters followed by "...".
 Runtime status and metrics go to stderr.
 Use --no-print-messages to consume without printing messages.
+
+--kafka uses OCI's Kafka compatibility endpoint over SASL_SSL/PLAIN. Discovery
+still uses instance principals and requires read stream-pools. Set
+OCI_KAFKA_USERNAME to tenancyName/[domain/]username/streamPoolId and
+OCI_KAFKA_AUTH_TOKEN to the OCI user's auth token in .env. Bootstrap servers
+are discovered from the stream pool; OCI_KAFKA_BOOTSTRAP_SERVERS overrides them.
+Kafka supports TRIM_HORIZON (earliest) and LATEST here; AT_TIME uses REST only.
+Kafka client retries and group heartbeats are managed by librdkafka.
+
+Conservative defaults: two workers, 1000 messages per batch, and two application
+calls/second shared by all workers (--request-rate). REST cursor creation,
+reads and commits share this cap; Kafka consume calls and commits share it.
+Kafka background network requests are managed separately by librdkafka; small
+prefetch queues and fetch backoff reduce bursts. Other processes share OCI's
+service limits, so these settings cannot guarantee that throttling never occurs.
 """
 import argparse
 import base64
@@ -67,24 +84,53 @@ import signal
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 import uuid
 
 USAGE_EXAMPLES = """Examples:
   ./runStreamConsumer.sh <stream-name> --group-name my-group --endpoint private
   ./runStreamConsumer.sh <stream-name> --group-name my-group --endpoint public
-  ./runStreamConsumer.sh <stream-name> --group-name my-group --duration 60 --workers 4
+  ./runStreamConsumer.sh <stream-name> --group-name my-group --duration 60 --workers 2 --request-rate 2
   ./runStreamConsumer.sh <stream-name> --group-name new-group --cursor-type LATEST
   ./runStreamConsumer.sh <stream-name> --group-name new-group --cursor-type AT_TIME --time 2026-11-09T00:00:00Z
   ./runStreamConsumer.sh <stream-name> --group-name my-group --max-messages 1000 --print-messages
   ./runStreamConsumer.sh --group-name my-group --endpoint private --dry-run
+  ./runStreamConsumer.sh <stream-name> --group-name kafka-group --endpoint private --kafka
+  ./runStreamConsumer.sh <stream-name> --group-name kafka-group --kafka --dry-run
 """
+
+
+class RateLimiter:
+    """Space actual call starts across workers without accumulating burst credits."""
+    def __init__(self, rate):
+        self.lock = threading.Lock()
+        self.interval = 1 / rate
+        self.next_call = 0.0
+
+    def wait(self, stop=None, deadline=None):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                if (stop is not None and stop.is_set()) or (deadline is not None and now >= deadline):
+                    return False
+                delay = self.next_call - now
+                if delay <= 0:
+                    self.next_call = now + self.interval
+                    return True
+            # Never hold the lock while waiting; check stop/deadline promptly.
+            delay = min(delay, .1)
+            if stop is None:
+                time.sleep(delay)
+            else:
+                stop.wait(delay)
 
 
 class State:
     """Reserve read capacity so concurrent workers honor the global message cap."""
-    def __init__(self, maximum):
+    def __init__(self, maximum, request_rate=2):
         self.lock = threading.Lock()
+        self.pacer = RateLimiter(request_rate)
         self.maximum = maximum
         self.reserved = 0
         self.consumed = self.committed = self.payload_bytes = self.requests = 0
@@ -133,6 +179,8 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
         if args.time is not None:
             details['time'] = args.time
         retry = dict(retry_strategy=oci.retry.NoneRetryStrategy())
+        if not state.pacer.wait(stop, deadline):
+            return
         cursor = require_cursor(client.create_group_cursor(args.stream_id,
             oci.streaming.models.CreateGroupCursorDetails(**details), **retry).data.value)
         while not stop.is_set() and time.monotonic() < deadline:
@@ -143,6 +191,8 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
                 stop.wait(.1)
                 continue
             try:
+                if not state.pacer.wait(stop, deadline):
+                    return
                 response = client.get_messages(args.stream_id, cursor, limit=limit, **retry)
                 messages = response.data
                 if messages is None or len(messages) > limit:
@@ -158,6 +208,7 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
                 state.record(messages, payload_bytes)
                 # Commit the returned cursor, including the last batch before stopping.
                 if messages:
+                    state.pacer.wait()  # Drain processed batches, including on interrupt/deadline.
                     cursor = require_cursor(client.consumer_commit(args.stream_id, next_cursor, **retry).data.value)
                     with state.lock:
                         state.committed += len(messages)
@@ -181,10 +232,78 @@ def report(snapshot, elapsed, final=False):
           f"errors {len(snapshot['errors'])}", file=sys.stderr, flush=True)
 
 
+def kafka_worker(kafka, client, args, state, stop, deadline, instance_name, output_lock):
+    try:
+        client.subscribe([args.stream_name])
+        while not stop.is_set() and time.monotonic() < deadline:
+            limit = state.claim(args.batch_size)
+            if limit is None:
+                return
+            if not limit:
+                stop.wait(.1)
+                continue
+            try:
+                if not state.pacer.wait(stop, deadline):
+                    return
+                records = client.consume(num_messages=limit,
+                    timeout=min(args.poll_interval, max(0, deadline - time.monotonic())))
+                messages, offsets = [], {}
+                payload_bytes = 0
+                for record in records:
+                    if record.error():
+                        raise kafka.KafkaException(record.error())
+                    value, key = record.value(), record.key()
+                    payload_bytes += len(value or b'')
+                    messages.append(SimpleNamespace(partition=record.partition(), offset=record.offset(),
+                        key=base64.b64encode(key).decode('ascii') if key is not None else None,
+                        value=base64.b64encode(value).decode('ascii') if value is not None else None))
+                    partition = (record.topic(), record.partition())
+                    offsets[partition] = max(offsets.get(partition, 0), record.offset() + 1)
+                if args.print_messages:
+                    with output_lock:
+                        for message in messages:
+                            print(json.dumps(dict(partition=message.partition, offset=message.offset,
+                                key=message.key, value=(message.value or '')[:10] + '...')), flush=True)
+                state.record(messages, payload_bytes)
+                if messages:
+                    state.pacer.wait()  # Final commits also share the process-wide rate cap.
+                    result = client.commit(offsets=[kafka.TopicPartition(topic, partition, offset)
+                        for (topic, partition), offset in offsets.items()], asynchronous=False)
+                    for partition in result or []:
+                        if partition.error:
+                            raise kafka.KafkaException(partition.error)
+                    with state.lock:
+                        state.committed += len(messages)
+            finally:
+                state.release(limit)
+    except Exception as error:
+        with state.lock:
+            state.errors.append(f'{instance_name}: {type(error).__name__}: {error}')
+        stop.set()
+
+
+def kafka_config(args, bootstrap_servers, instance_name):
+    return {'bootstrap.servers': bootstrap_servers, 'security.protocol': 'SASL_SSL',
+            'sasl.mechanism': 'PLAIN', 'sasl.username': args.kafka_username,
+            'sasl.password': os.environ['OCI_KAFKA_AUTH_TOKEN'],
+            'group.id': args.group_name, 'client.id': instance_name,
+            'group.protocol': 'classic', 'session.timeout.ms': 30000,
+            'heartbeat.interval.ms': 10000,
+            'enable.auto.commit': False, 'enable.auto.offset.store': False,
+            'auto.offset.reset': 'earliest' if args.cursor_type == 'TRIM_HORIZON' else 'latest',
+            'allow.auto.create.topics': False, 'max.partition.fetch.bytes': 1024 * 1024,
+            'fetch.max.bytes': 1024 * 1024, 'queued.min.messages': 1,
+            'queued.max.messages.kbytes': 1024, 'fetch.queue.backoff.ms': 1000,
+            'fetch.error.backoff.ms': 1000, 'retry.backoff.ms': 1000,
+            'retry.backoff.max.ms': 10000,
+            'socket.connection.setup.timeout.ms': max(1000, int(args.connect_timeout * 1000)),
+            'socket.timeout.ms': max(1000, int(args.request_timeout * 1000))}
+
+
 def consume(oci, clients, args, run_id):
     stop = threading.Event()
     interrupted = threading.Event()
-    state = State(args.max_messages)
+    state = State(args.max_messages, args.request_rate)
     output_lock = threading.Lock()
     old_signals = {}
     def interrupt(signum, frame):
@@ -197,7 +316,8 @@ def consume(oci, clients, args, run_id):
     prefix = args.instance_name or run_id
     try:
         with ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix='stream-consumer') as pool:
-            tasks = [pool.submit(worker, oci, client, args, state, stop, deadline,
+            target = kafka_worker if args.kafka else worker
+            tasks = [pool.submit(target, oci, client, args, state, stop, deadline,
                                  f'{prefix}-{index}', output_lock)
                      for index, client in enumerate(clients)]
             next_report = started + args.report_interval
@@ -226,6 +346,8 @@ def consume(oci, clients, args, run_id):
         summary = dict(run_id=run_id, stream_id=args.stream_id, stream_name=args.stream_name,
                        group_name=args.group_name, instance_name_prefix=prefix,
                        workers=args.workers, batch_size=args.batch_size, elapsed_seconds=elapsed,
+                       request_rate=args.request_rate,
+                       protocol='kafka' if args.kafka else 'rest',
                        interrupted=interrupted.is_set(), **snapshot)
         args.json_report.expanduser().write_text(json.dumps(summary, indent=2) + '\n')
         print('JSON report: ' + str(args.json_report.expanduser()), file=sys.stderr)
@@ -294,13 +416,20 @@ def main(argv=None):
     parser.add_argument('--group-name', default=os.getenv('OCI_STREAM_GROUP_NAME') or None,
                         help='consumer group name (required; default: OCI_STREAM_GROUP_NAME in .env)')
     parser.add_argument('--instance-name', help='unique instance name prefix; worker index is appended (default: random UUID)')
+    parser.add_argument('--kafka', action='store_true', help='consume over OCI Kafka compatibility using SASL_SSL/PLAIN')
+    parser.add_argument('--kafka-username', default=os.getenv('OCI_KAFKA_USERNAME') or None,
+                        help='tenancyName/[domain/]username/streamPoolId (default: OCI_KAFKA_USERNAME)')
+    parser.add_argument('--kafka-bootstrap-servers', default=os.getenv('OCI_KAFKA_BOOTSTRAP_SERVERS') or None,
+                        help='Kafka host:port list (default: OCI_KAFKA_BOOTSTRAP_SERVERS, otherwise discover from pool)')
     parser.add_argument('--endpoint', default=os.getenv('OCI_STREAM_ENDPOINT') or None,
                         metavar='private|public|HTTPS_URL', help='endpoint type or HTTPS messages URL (default: OCI_STREAM_ENDPOINT, otherwise discover)')
     parser.add_argument('--region', default=os.getenv('OCI_REGION') or None,
                         help='stream region (default: OCI_REGION, otherwise instance region)')
     parser.add_argument('--duration', type=positive_float, default=60, help='seconds to start new reads (default: 60)')
-    parser.add_argument('--workers', type=positive_int, default=4, help='consumer group instances (default: 4; maximum: 128)')
-    parser.add_argument('--batch-size', type=positive_int, default=100, help='maximum messages/read (default: 100; maximum: 10000)')
+    parser.add_argument('--workers', type=positive_int, default=2, help='consumer group instances sharing the rate cap (default: 2; maximum: 128)')
+    parser.add_argument('--batch-size', type=positive_int, default=1000, help='maximum messages/read (default: 1000; maximum: 10000)')
+    parser.add_argument('--request-rate', type=positive_float, default=2,
+                        help='application calls/second across all workers, including commits (default: 2; Kafka background fetches are separate)')
     parser.add_argument('--max-messages', type=positive_int, help='maximum messages consumed across all workers in this process')
     parser.add_argument('--cursor-type', choices=('TRIM_HORIZON', 'LATEST', 'AT_TIME'), default='TRIM_HORIZON',
                         help='starting position for a NEW group (default: TRIM_HORIZON)')
@@ -332,6 +461,15 @@ def main(argv=None):
         parser.error('--poll-interval must not exceed 10 to keep group membership active')
     if (args.cursor_type == 'AT_TIME') != (args.time is not None):
         parser.error('--time is required with AT_TIME and only valid with AT_TIME')
+    if args.kafka and args.cursor_type == 'AT_TIME':
+        parser.error('--kafka supports TRIM_HORIZON and LATEST; use REST for AT_TIME')
+    if args.kafka and args.endpoint and args.endpoint not in ('private', 'public'):
+        parser.error('--kafka uses --endpoint private|public; use --kafka-bootstrap-servers for a host:port override')
+    if args.kafka and not args.dry_run:
+        if not args.kafka_username or not args.kafka_username.strip():
+            parser.error('set OCI_KAFKA_USERNAME or provide --kafka-username for --kafka')
+        if not os.getenv('OCI_KAFKA_AUTH_TOKEN'):
+            parser.error('set OCI_KAFKA_AUTH_TOKEN in .env for --kafka')
     if args.endpoint and args.endpoint not in ('private', 'public'):
         endpoint = urlsplit(args.endpoint)
         if (endpoint.scheme != 'https' or not endpoint.hostname or endpoint.username or endpoint.password or
@@ -344,14 +482,25 @@ def main(argv=None):
             endpoint_plan = f'discover {args.endpoint} endpoint using stream pool type'
         print(f'Dry run: instance-principal authentication; stream name={args.stream_name}')
         print(f'Endpoint: {endpoint_plan}; lookup scope: configured compartment (.env)')
+        if args.kafka:
+            print('Protocol: Kafka SASL_SSL/PLAIN; user auth token required via OCI_KAFKA_AUTH_TOKEN')
+            print('Kafka bootstrap: ' + (args.kafka_bootstrap_servers or 'discover from stream pool Kafka settings'))
         print(f'Group: {args.group_name}; instance prefix: {args.instance_name or "random UUID"}; workers: {args.workers}')
         print(f'New group position: {args.cursor_type}; time: {args.time}; existing group: resume committed offsets')
         print(f'Duration: {args.duration:g}s; batch size: {args.batch_size}; maximum consumed: {args.max_messages or "duration-limited"}')
+        print(f'Pacing: {args.request_rate:g} application calls/sec shared by all workers, including commits')
+        if args.kafka:
+            print('Kafka background fetches are separate; prefetch is limited with 1-second queue/error backoff')
         print('Commit: explicit after each processed batch; message output: ' + str(args.print_messages))
         print('No SDK import, authentication, consumption, offset commits or report writes.')
         return 0
     try:
         import oci
+        if args.kafka:
+            try:
+                import confluent_kafka
+            except ImportError as error:
+                raise RuntimeError('Kafka client missing; run prepareOL.sh/prepareDebian.sh or install confluent-kafka in the active virtualenv.') from error
         if args.debug:
             logging.basicConfig(level=logging.DEBUG)
         print('Authenticating with OCI instance principals...', file=sys.stderr, flush=True)
@@ -367,7 +516,12 @@ def main(argv=None):
             stream = resolve_stream(oci, admin, args)
             args.stream_id = stream.id
             print(f'Stream: {stream.name}; ID: {stream.id}', file=sys.stderr, flush=True)
-            if not endpoint:
+            if args.kafka:
+                pool = admin.get_stream_pool(stream.stream_pool_id, retry_strategy=oci.retry.NoneRetryStrategy()).data
+                if not args.kafka_username.endswith('/' + stream.stream_pool_id):
+                    raise RuntimeError('Kafka username must end with / followed by the selected stream pool OCID.')
+                endpoint = args.kafka_bootstrap_servers or pool.kafka_settings.bootstrap_servers
+            elif not endpoint:
                 stream = admin.get_stream(args.stream_id, retry_strategy=oci.retry.NoneRetryStrategy()).data
                 if stream.lifecycle_state != 'ACTIVE':
                     raise RuntimeError(f'Stream is {stream.lifecycle_state}; expected ACTIVE.')
@@ -377,15 +531,25 @@ def main(argv=None):
             admin.base_client.session.close()
         if not endpoint:
             raise RuntimeError('Stream has no messages endpoint; specify --endpoint.')
-        print(f'Messages endpoint: {endpoint}; group: {args.group_name}; workers: {args.workers}', file=sys.stderr, flush=True)
+        print(f'{"Kafka bootstrap" if args.kafka else "Messages endpoint"}: {endpoint}; group: {args.group_name}; workers: {args.workers}', file=sys.stderr, flush=True)
         clients = []
+        run_id = uuid.uuid4().hex
+        print(f'Pacing: {args.request_rate:g} application calls/sec across {args.workers} worker(s), including commits',
+              file=sys.stderr, flush=True)
         try:
-            for _ in range(args.workers):
-                clients.append(oci.streaming.StreamClient(config, endpoint, **common))
-            return consume(oci, clients, args, uuid.uuid4().hex)
+            for index in range(args.workers):
+                if args.kafka:
+                    clients.append(confluent_kafka.Consumer(kafka_config(args, endpoint,
+                        f'{args.instance_name or run_id}-{index}')))
+                else:
+                    clients.append(oci.streaming.StreamClient(config, endpoint, **common))
+            return consume(confluent_kafka if args.kafka else oci, clients, args, run_id)
         finally:
             for client in clients:
-                client.base_client.session.close()
+                if args.kafka:
+                    client.close()
+                else:
+                    client.base_client.session.close()
     except KeyboardInterrupt:
         return 130
     except Exception as error:
