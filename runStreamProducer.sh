@@ -35,15 +35,15 @@ exec "$@" <<'OCI_STREAM_PRODUCER_PY'
 
 No OCI CLI, OCI credentials config, SSO profile or API key is used. Run on an OCI instance.
 The VM's dynamic group needs permission to use stream-push. Endpoint discovery
-also needs read streams for name lookup and endpoint discovery. The default
+also needs read streams for name lookup and endpoint discovery, and read
+stream-pools when selecting a private or public endpoint. The default
 lookup scope is OCI_COMPARTMENT_ID, required in the adjacent .env file.
 Stream name, endpoint and region can also default from that file.
 A private endpoint requires a private network path and DNS resolution from this instance.
 
-Examples:
-  ./runStreamProducer.sh <stream-name> --duration 60 --workers 4
-  ./runStreamProducer.sh <stream-name> --rate 2000 --max-messages 100000
-  ./runStreamProducer.sh <stream-name> --endpoint https://<messages-host> --dry-run
+--endpoint private|public selects a stream whose pool has that endpoint type;
+it does not change the pool's network configuration. With no endpoint directive,
+the stream's configured messages endpoint is discovered automatically.
 
 Payloads contain random bytes, reused within a worker. Unique keys spread load
 across partitions; --key deliberately puts the load on one partition. A batch
@@ -71,6 +71,14 @@ import uuid
 MAX_BATCH_BYTES = 1_000_000
 KEY_BUDGET = 96
 LATENCY_BOUNDS = (.001, .002, .005, .01, .02, .05, .1, .2, .5, 1, 2, 5, 10, 30, 60, float('inf'))
+USAGE_EXAMPLES = """Examples:
+  ./runStreamProducer.sh <stream-name> --endpoint private
+  ./runStreamProducer.sh <stream-name> --endpoint public
+  ./runStreamProducer.sh <stream-name> --duration 60 --workers 4
+  ./runStreamProducer.sh <stream-name> --rate 2000 --max-messages 100000
+  ./runStreamProducer.sh <stream-name> --endpoint https://<messages-host> --dry-run
+  ./runStreamProducer.sh --endpoint private --dry-run  # stream name from .env
+"""
 
 
 class Allocator:
@@ -320,17 +328,38 @@ def resolve_stream(oci, admin, args):
     matches = [stream for stream in streams if stream.name == args.stream_name and stream.lifecycle_state == 'ACTIVE']
     if not matches:
         raise RuntimeError(f'No ACTIVE stream named {args.stream_name!r} found in the selected scope.')
+    if args.endpoint in ('private', 'public'):
+        pools = {}
+        selected = []
+        for stream in matches:
+            if stream.stream_pool_id not in pools:
+                pool = admin.get_stream_pool(stream.stream_pool_id,
+                    retry_strategy=oci.retry.NoneRetryStrategy()).data
+                if pool.is_private is not True and pool.is_private is not False:
+                    raise RuntimeError(f'Cannot determine endpoint type for stream pool {stream.stream_pool_id}.')
+                pools[stream.stream_pool_id] = pool.is_private
+            if pools[stream.stream_pool_id] == (args.endpoint == 'private'):
+                selected.append(stream)
+        matches = selected
+        if not matches:
+            raise RuntimeError(f'No ACTIVE stream named {args.stream_name!r} with a {args.endpoint} endpoint '
+                               'found in the configured compartment. Endpoint type is configured on the stream pool.')
     if len(matches) > 1:
-        raise RuntimeError(f'Multiple ACTIVE streams named {args.stream_name!r} in the configured compartment; use a unique stream name.')
+        qualifier = f' with a {args.endpoint} endpoint' if args.endpoint in ('private', 'public') else ''
+        raise RuntimeError(f'Multiple ACTIVE streams named {args.stream_name!r}{qualifier} in the configured compartment; use a unique stream name.')
     return matches[0]
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(prog='runStreamProducer.sh', description=__doc__,
+                                     epilog=USAGE_EXAMPLES,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('stream_name', nargs='?', default=os.getenv('OCI_STREAM_NAME') or None,
                         help='exact stream name (default: OCI_STREAM_NAME in .env)')
     parser.add_argument('--endpoint', default=os.getenv('OCI_STREAM_ENDPOINT') or None,
-                        help='messages endpoint (default: OCI_STREAM_ENDPOINT in .env, otherwise discover)')
+                        metavar='private|public|HTTPS_URL',
+                        help='discover a private/public messages endpoint, or use an HTTPS URL '
+                             '(default: OCI_STREAM_ENDPOINT in .env, otherwise discover configured endpoint)')
     parser.add_argument('--region', default=os.getenv('OCI_REGION') or None,
                         help='stream region (default: OCI_REGION in .env, otherwise instance region)')
     parser.add_argument('--duration', type=positive_float, default=60, help='seconds to start new requests (default: 60)')
@@ -366,16 +395,19 @@ def main(argv=None):
     batch_size = min(args.batch_size, MAX_BATCH_BYTES // per_message)
     if args.rate:
         batch_size = min(batch_size, max(1, int(args.rate / 10)))
-    if args.endpoint:
+    if args.endpoint and args.endpoint not in ('private', 'public'):
         endpoint = urlsplit(args.endpoint)
         if (endpoint.scheme != 'https' or not endpoint.hostname or endpoint.username or endpoint.password or
                 endpoint.query or endpoint.fragment or endpoint.path not in ('', '/')):
-            parser.error('--endpoint must be an HTTPS messages endpoint URL without path, credentials or query')
+            parser.error('--endpoint must be private, public, or an HTTPS messages endpoint URL without path, credentials or query')
         args.endpoint = args.endpoint.rstrip('/')
     if args.dry_run:
         print(f'Dry run: instance-principal authentication; stream name={args.stream_name}')
         print('Lookup scope: configured compartment (.env)')
-        print(f'Endpoint: {args.endpoint or "discover with StreamAdminClient.get_stream"}')
+        endpoint_plan = args.endpoint or 'discover with StreamAdminClient.get_stream'
+        if args.endpoint in ('private', 'public'):
+            endpoint_plan = f'discover {args.endpoint} endpoint using stream pool type and StreamAdminClient.get_stream'
+        print(f'Endpoint: {endpoint_plan}')
         print(f'Duration: {args.duration:g}s; workers: {args.workers}; effective batch size: {batch_size}; payload: {args.message_size} bytes')
         print(f'Rate: {args.rate:g} messages/sec (0=unlimited); maximum attempted: {args.max_messages or "duration-limited"}')
         print(f'Decoded batch budget: <= {batch_size * per_message:,} bytes; keys: {"fixed/single partition" if args.key is not None else "unique/distributed"}')
@@ -393,7 +425,7 @@ def main(argv=None):
         config = {'region': region}
         common = {'signer': signer, 'timeout': (args.connect_timeout, args.request_timeout),
                   'retry_strategy': oci.retry.NoneRetryStrategy()}
-        endpoint = args.endpoint
+        endpoint = None if args.endpoint in ('private', 'public') else args.endpoint
         admin = oci.streaming.StreamAdminClient(config, **common)
         try:
             stream = resolve_stream(oci, admin, args)
