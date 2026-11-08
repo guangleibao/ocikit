@@ -87,6 +87,7 @@ class ConsumerTests(unittest.TestCase):
         self.assertIsNone(state.claim(2))
 
     def test_full_run_discovers_endpoint_caps_workers_and_writes_report(self):
+        self.message.value = 'aGVsbG8gd29ybGQ='
         stream = SimpleNamespace(name='events', id='stream', lifecycle_state='ACTIVE',
                                  stream_pool_id='pool', messages_endpoint='https://messages.example.com',
                                  partitions=2)
@@ -106,7 +107,7 @@ class ConsumerTests(unittest.TestCase):
             summary = json.loads(path.read_text())
         messages = [json.loads(line) for line in output.splitlines()]
         self.assertEqual(len(messages), 3)
-        self.assertEqual(messages[0], dict(partition='0', offset=1, key='aw==', value='aGk='))
+        self.assertEqual(messages[0], dict(partition='0', offset=1, key='aw==', value='aGVsbG8gd2...'))
         self.assertIn('FINAL', self.stderr_output)
         self.assertIn('Messages endpoint:', self.stderr_output)
         self.assertEqual((summary['consumed'], summary['committed']), (3, 3))

@@ -49,7 +49,8 @@ SDK calls are not retried automatically; errors stop the run with exit code 1.
 A duration limits new reads; in-flight reads and commits drain to their timeouts.
 Ctrl-C/SIGTERM drains fetched batches and exits 130. Metrics are per this process,
 not the entire consumer group. Messages are printed as JSON lines to stdout;
-keys and values remain base64. Runtime status and metrics go to stderr.
+Keys remain base64; values show the first 10 base64 characters followed by "...".
+Runtime status and metrics go to stderr.
 Use --no-print-messages to consume without printing messages.
 """
 import argparse
@@ -153,7 +154,7 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
                     with output_lock:
                         for message in messages:
                             print(json.dumps(dict(partition=message.partition, offset=message.offset,
-                                                  key=message.key, value=message.value)), flush=True)
+                                                  key=message.key, value=(message.value or '')[:10] + '...')), flush=True)
                 state.record(messages, payload_bytes)
                 # Commit the returned cursor, including the last batch before stopping.
                 if messages:
@@ -309,7 +310,7 @@ def main(argv=None):
     parser.add_argument('--connect-timeout', type=positive_float, default=5)
     parser.add_argument('--request-timeout', type=positive_float, default=30)
     parser.add_argument('--print-messages', action=argparse.BooleanOptionalAction, default=True,
-                        help='print each message to stdout as JSON with base64 key/value (default: enabled)')
+                        help='print JSON messages to stdout; base64 values show a 10-character prefix plus ... (default: enabled)')
     parser.add_argument('--json-report', type=Path, help='save final metrics as JSON to this local file')
     parser.add_argument('--debug', action='store_true', help='enable SDK debug logging')
     parser.add_argument('--dry-run', action='store_true', help='show plan without importing OCI, authenticating or consuming')
