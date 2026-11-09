@@ -4,6 +4,7 @@
 set -eu
 # Load deployment settings from .env beside this script, not the working directory.
 OCIKIT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export OCIKIT_DIR
 if [ -f "$OCIKIT_DIR/.env" ]; then
     set -a
     . "$OCIKIT_DIR/.env"
@@ -57,19 +58,23 @@ Keys remain base64; values show the first 10 base64 characters followed by "..."
 Runtime status and metrics go to stderr.
 Use --no-print-messages to consume without printing messages.
 
---kafka uses OCI's Kafka compatibility endpoint over SASL_SSL/PLAIN. Discovery
+--api oci (default) uses OCI's Python SDK. --api kafka-python uses the Python
+confluent-kafka client; --api kafka-java uses Apache Kafka's Java client. Both
+Kafka modes use OCI's Kafka compatibility endpoint over SASL_SSL/PLAIN. Discovery
 still uses instance principals and requires read stream-pools. Set
 OCI_KAFKA_USERNAME to tenancyName/[domain/]username/streamPoolId and
 OCI_KAFKA_AUTH_TOKEN to the OCI user's auth token in .env. Bootstrap servers
 are discovered from the stream pool; OCI_KAFKA_BOOTSTRAP_SERVERS overrides them.
-Kafka supports TRIM_HORIZON (earliest) and LATEST here; AT_TIME uses REST only.
-Kafka client retries and group heartbeats are managed by librdkafka.
+Kafka maps TRIM_HORIZON to earliest and supports AT_TIME for partitions without
+committed offsets. Existing committed offsets are preserved in every mode.
+Kafka retries and group heartbeats are managed by the selected Kafka client.
+Java mode needs the jar built by prepareOL.sh/prepareDebian.sh (JDK and Maven).
 
 Conservative defaults: two workers, 1000 messages per batch, and two application
 calls/second shared by all workers (--request-rate). REST cursor creation,
 reads and commits share this cap; Kafka consume calls and commits share it.
-Kafka background network requests are managed separately by librdkafka; small
-prefetch queues and fetch backoff reduce bursts. Other processes share OCI's
+Kafka background network requests are managed separately by the Kafka clients;
+fetch limits and backoff reduce bursts. Other processes share OCI's
 service limits, so these settings cannot guarantee that throttling never occurs.
 """
 import argparse
@@ -83,6 +88,9 @@ import math
 import os
 from pathlib import Path
 import signal
+import subprocess
+import shutil
+import select
 import sys
 import threading
 import time
@@ -91,15 +99,15 @@ from urllib.parse import urlsplit
 import uuid
 
 USAGE_EXAMPLES = """Examples:
-  ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --endpoint private
+  ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --endpoint private --api oci
   ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --endpoint public
   ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --duration 60 --workers 2 --request-rate 2
   ./runStreamConsumerDemo.sh <stream-name> --group-name new-group --cursor-type LATEST
   ./runStreamConsumerDemo.sh <stream-name> --group-name new-group --cursor-type AT_TIME --time 2026-11-09T00:00:00Z
   ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --max-messages 1000 --print-messages
   ./runStreamConsumerDemo.sh --group-name my-group --endpoint private --dry-run
-  ./runStreamConsumerDemo.sh <stream-name> --group-name kafka-group --endpoint private --kafka
-  ./runStreamConsumerDemo.sh <stream-name> --group-name kafka-group --kafka --dry-run
+  ./runStreamConsumerDemo.sh <stream-name> --group-name kafka-group --endpoint private --api kafka-python
+  ./runStreamConsumerDemo.sh <stream-name> --group-name kafka-group --api kafka-java --dry-run
 """
 
 
@@ -236,7 +244,29 @@ def report(snapshot, elapsed, final=False):
 
 def kafka_worker(kafka, client, args, state, stop, deadline, instance_name, output_lock):
     try:
-        client.subscribe([args.stream_name])
+        if args.api == 'kafka-python' and args.cursor_type == 'AT_TIME':
+            def assigned(consumer, partitions):
+                committed = consumer.committed(partitions, timeout=args.request_timeout)
+                missing = []
+                for partition, saved in zip(partitions, committed):
+                    if saved.error:
+                        raise kafka.KafkaException(saved.error)
+                    if saved.offset >= 0:
+                        partition.offset = saved.offset
+                    else:
+                        missing.append(partition)
+                if missing:
+                    timestamp_ms = int(args.time.timestamp() * 1000)
+                    offsets = consumer.offsets_for_times([kafka.TopicPartition(p.topic, p.partition, timestamp_ms)
+                        for p in missing], timeout=args.request_timeout)
+                    for partition, found in zip(missing, offsets):
+                        if found.error:
+                            raise kafka.KafkaException(found.error)
+                        partition.offset = found.offset if found.offset >= 0 else kafka.OFFSET_END
+                consumer.assign(partitions)
+            client.subscribe([args.stream_name], on_assign=assigned)
+        else:
+            client.subscribe([args.stream_name])
         while not stop.is_set() and time.monotonic() < deadline:
             limit = state.claim(args.batch_size)
             if limit is None:
@@ -302,6 +332,102 @@ def kafka_config(args, bootstrap_servers, instance_name):
             'socket.timeout.ms': max(1000, int(args.request_timeout * 1000))}
 
 
+class JavaKafkaRecord:
+    """Adapt a Java consumer record to the shared Kafka processing loop."""
+    def __init__(self, data):
+        self.data = data
+
+    def error(self):
+        return None
+
+    def topic(self):
+        return self.data['topic']
+
+    def partition(self):
+        return self.data['partition']
+
+    def offset(self):
+        return self.data['offset']
+
+    def key(self):
+        return base64.b64decode(self.data['key']) if self.data['key'] is not None else None
+
+    def value(self):
+        return base64.b64decode(self.data['value']) if self.data['value'] is not None else None
+
+
+JAVA_KAFKA = SimpleNamespace(KafkaException=RuntimeError,
+    TopicPartition=lambda topic, partition, offset: SimpleNamespace(topic=topic, partition=partition, offset=offset))
+
+
+class JavaKafkaClient:
+    """One native Java KafkaConsumer per worker; JSON pipes carry commands only."""
+    def __init__(self, args, bootstrap_servers, instance_name):
+        root = Path(os.environ.get('OCIKIT_DIR', '.'))
+        jar = root / 'kafka-java' / 'target' / 'stream-consumer.jar'
+        if not shutil.which('java') or not jar.is_file():
+            raise RuntimeError('Java Kafka client missing; run prepareOL.sh/prepareDebian.sh '
+                               'or build with mvn -f kafka-java/pom.xml package (JDK 17+).')
+        self.timeout = args.request_timeout + args.connect_timeout + args.poll_interval + 10
+        self.process = subprocess.Popen(['java', '-jar', str(jar)], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
+        try:
+            self._request('init', bootstrap=bootstrap_servers, username=args.kafka_username,
+                group=args.group_name, instance=instance_name, batch_size=args.batch_size,
+                cursor_type=args.cursor_type, timestamp_ms=int(args.time.timestamp() * 1000) if args.time else None,
+                connect_timeout_ms=max(1000, int(args.connect_timeout * 1000)),
+                request_timeout_ms=max(1000, int(args.request_timeout * 1000)), debug=args.debug)
+        except BaseException:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            self.process.stdin.close()
+            self.process.stdout.close()
+            raise
+
+    def _request(self, operation, **values):
+        self.process.stdin.write(json.dumps(dict(op=operation, **values)) + '\n')
+        self.process.stdin.flush()
+        if not select.select([self.process.stdout], [], [], self.timeout)[0]:
+            raise RuntimeError('Java Kafka client timed out responding to ' + operation)
+        line = self.process.stdout.readline()
+        if not line:
+            raise RuntimeError('Java Kafka client exited during ' + operation + '; see stderr')
+        response = json.loads(line)
+        if 'error' in response:
+            raise RuntimeError(response['error'])
+        return response
+
+    def subscribe(self, topics):
+        self._request('subscribe', topics=topics)
+
+    def consume(self, num_messages, timeout):
+        return [JavaKafkaRecord(record) for record in self._request('consume',
+            limit=num_messages, timeout_ms=max(1, int(timeout * 1000)))['records']]
+
+    def commit(self, offsets, asynchronous=False):
+        if asynchronous:
+            raise ValueError('Java consumer commits must be synchronous')
+        self._request('commit', offsets=[vars(partition) for partition in offsets])
+        return []
+
+    def close(self):
+        try:
+            if self.process.poll() is None:
+                self._request('close')
+        finally:
+            self.process.stdin.close()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            self.process.stdout.close()
+
+
 def consume(oci, clients, args, run_id):
     stop = threading.Event()
     interrupted = threading.Event()
@@ -318,7 +444,7 @@ def consume(oci, clients, args, run_id):
     prefix = args.instance_name or run_id
     try:
         with ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix='stream-consumer') as pool:
-            target = kafka_worker if args.kafka else worker
+            target = kafka_worker if (args.api != 'oci') else worker
             tasks = [pool.submit(target, oci, client, args, state, stop, deadline,
                                  f'{prefix}-{index}', output_lock)
                      for index, client in enumerate(clients)]
@@ -349,7 +475,7 @@ def consume(oci, clients, args, run_id):
                        group_name=args.group_name, instance_name_prefix=prefix,
                        workers=args.workers, batch_size=args.batch_size, elapsed_seconds=elapsed,
                        request_rate=args.request_rate,
-                       protocol='kafka' if args.kafka else 'rest',
+                       protocol='kafka' if (args.api != 'oci') else 'rest', api=args.api,
                        interrupted=interrupted.is_set(), **snapshot)
         args.json_report.expanduser().write_text(json.dumps(summary, indent=2) + '\n')
         print('JSON report: ' + str(args.json_report.expanduser()), file=sys.stderr)
@@ -418,7 +544,8 @@ def main(argv=None):
     parser.add_argument('--group-name', default=os.getenv('OCI_STREAM_GROUP_NAME') or None,
                         help='consumer group name (required; default: OCI_STREAM_GROUP_NAME in .env)')
     parser.add_argument('--instance-name', help='unique instance name prefix; worker index is appended (default: random UUID)')
-    parser.add_argument('--kafka', action='store_true', help='consume over OCI Kafka compatibility using SASL_SSL/PLAIN')
+    parser.add_argument('--api', choices=('oci', 'kafka-python', 'kafka-java'), default='oci',
+                        help='consumer implementation (default: oci)')
     parser.add_argument('--kafka-username', default=os.getenv('OCI_KAFKA_USERNAME') or None,
                         help='tenancyName/[domain/]username/streamPoolId (default: OCI_KAFKA_USERNAME)')
     parser.add_argument('--kafka-bootstrap-servers', default=os.getenv('OCI_KAFKA_BOOTSTRAP_SERVERS') or None,
@@ -464,15 +591,13 @@ def main(argv=None):
         parser.error('--poll-interval must not exceed 10 to keep group membership active')
     if (args.cursor_type == 'AT_TIME') != (args.time is not None):
         parser.error('--time is required with AT_TIME and only valid with AT_TIME')
-    if args.kafka and args.cursor_type == 'AT_TIME':
-        parser.error('--kafka supports TRIM_HORIZON and LATEST; use REST for AT_TIME')
-    if args.kafka and args.endpoint and args.endpoint not in ('private', 'public'):
-        parser.error('--kafka uses --endpoint private|public; use --kafka-bootstrap-servers for a host:port override')
-    if args.kafka and not args.dry_run:
+    if (args.api != 'oci') and args.endpoint and args.endpoint not in ('private', 'public'):
+        parser.error('Kafka APIs use --endpoint private|public; use --kafka-bootstrap-servers for a host:port override')
+    if (args.api != 'oci') and not args.dry_run:
         if not args.kafka_username or not args.kafka_username.strip():
-            parser.error('set OCI_KAFKA_USERNAME or provide --kafka-username for --kafka')
+            parser.error('set OCI_KAFKA_USERNAME or provide --kafka-username for Kafka APIs')
         if not os.getenv('OCI_KAFKA_AUTH_TOKEN'):
-            parser.error('set OCI_KAFKA_AUTH_TOKEN in .env for --kafka')
+            parser.error('set OCI_KAFKA_AUTH_TOKEN in .env for Kafka APIs')
     if args.endpoint and args.endpoint not in ('private', 'public'):
         endpoint = urlsplit(args.endpoint)
         if (endpoint.scheme != 'https' or not endpoint.hostname or endpoint.username or endpoint.password or
@@ -483,9 +608,9 @@ def main(argv=None):
         endpoint_plan = args.endpoint or 'discover configured messages endpoint'
         if args.endpoint in ('private', 'public'):
             endpoint_plan = f'discover {args.endpoint} endpoint using stream pool type'
-        print(f'Dry run: instance-principal authentication; stream name={args.stream_name}')
+        print(f'Dry run: api={args.api}; instance-principal discovery; stream name={args.stream_name}')
         print(f'Endpoint: {endpoint_plan}; lookup scope: configured compartment (.env)')
-        if args.kafka:
+        if (args.api != 'oci'):
             print('Protocol: Kafka SASL_SSL/PLAIN; user auth token required via OCI_KAFKA_AUTH_TOKEN')
             print('Kafka bootstrap: ' + (args.kafka_bootstrap_servers or 'discover from stream pool Kafka settings'))
         print(f'Group: {args.group_name}; instance prefix: {args.instance_name or "random UUID"}; workers: {args.workers}')
@@ -493,14 +618,16 @@ def main(argv=None):
         duration_plan = f'{args.duration:g}s' if args.duration is not None else 'unlimited (until Ctrl-C)'
         print(f'Duration: {duration_plan}; batch size: {args.batch_size}; maximum consumed: {args.max_messages or "unlimited"}')
         print(f'Pacing: {args.request_rate:g} application calls/sec shared by all workers, including commits')
-        if args.kafka:
+        if args.api == 'kafka-python':
             print('Kafka background fetches are separate; prefetch is limited with 1-second queue/error backoff')
+        elif args.api == 'kafka-java':
+            print('Java Kafka: native KafkaConsumer; bounded fetches; shared poll/commit pacing; JDK and built jar required')
         print('Commit: explicit after each processed batch; message output: ' + str(args.print_messages))
         print('No SDK import, authentication, consumption, offset commits or report writes.')
         return 0
     try:
         import oci
-        if args.kafka:
+        if args.api == 'kafka-python':
             try:
                 import confluent_kafka
             except ImportError as error:
@@ -520,7 +647,7 @@ def main(argv=None):
             stream = resolve_stream(oci, admin, args)
             args.stream_id = stream.id
             print(f'Stream: {stream.name}; ID: {stream.id}', file=sys.stderr, flush=True)
-            if args.kafka:
+            if (args.api != 'oci'):
                 pool = admin.get_stream_pool(stream.stream_pool_id, retry_strategy=oci.retry.NoneRetryStrategy()).data
                 if not args.kafka_username.endswith('/' + stream.stream_pool_id):
                     raise RuntimeError('Kafka username must end with / followed by the selected stream pool OCID.')
@@ -535,22 +662,25 @@ def main(argv=None):
             admin.base_client.session.close()
         if not endpoint:
             raise RuntimeError('Stream has no messages endpoint; specify --endpoint.')
-        print(f'{"Kafka bootstrap" if args.kafka else "Messages endpoint"}: {endpoint}; group: {args.group_name}; workers: {args.workers}', file=sys.stderr, flush=True)
+        print(f'{"Kafka bootstrap" if args.api != "oci" else "Messages endpoint"}: {endpoint}; group: {args.group_name}; workers: {args.workers}', file=sys.stderr, flush=True)
         clients = []
         run_id = uuid.uuid4().hex
         print(f'Pacing: {args.request_rate:g} application calls/sec across {args.workers} worker(s), including commits',
               file=sys.stderr, flush=True)
         try:
             for index in range(args.workers):
-                if args.kafka:
-                    clients.append(confluent_kafka.Consumer(kafka_config(args, endpoint,
-                        f'{args.instance_name or run_id}-{index}')))
+                instance_name = f'{args.instance_name or run_id}-{index}'
+                if args.api == 'kafka-python':
+                    clients.append(confluent_kafka.Consumer(kafka_config(args, endpoint, instance_name)))
+                elif args.api == 'kafka-java':
+                    clients.append(JavaKafkaClient(args, endpoint, instance_name))
                 else:
                     clients.append(oci.streaming.StreamClient(config, endpoint, **common))
-            return consume(confluent_kafka if args.kafka else oci, clients, args, run_id)
+            backend = confluent_kafka if args.api == 'kafka-python' else JAVA_KAFKA if args.api == 'kafka-java' else oci
+            return consume(backend, clients, args, run_id)
         finally:
             for client in clients:
-                if args.kafka:
+                if (args.api != 'oci'):
                     client.close()
                 else:
                     client.base_client.session.close()

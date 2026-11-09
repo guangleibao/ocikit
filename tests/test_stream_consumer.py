@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import threading
 import tempfile
 import time
+from datetime import datetime, timezone
 import unittest
 from unittest.mock import Mock, patch
 
@@ -29,7 +30,7 @@ class ConsumerTests(unittest.TestCase):
             data=[self.message], headers={'opc-next-cursor': 'next'})
         self.client.consumer_commit.return_value.data.value = 'committed'
         self.args = SimpleNamespace(stream_id='stream', group_name='group', cursor_type='TRIM_HORIZON',
-                                    time=None, batch_size=100, print_messages=False, poll_interval=.001)
+                                    time=None, batch_size=100, print_messages=False, poll_interval=.001, api='kafka-python')
 
     def run_worker(self, maximum=1):
         state = CONSUMER['State'](maximum, request_rate=10000)
@@ -155,7 +156,7 @@ class ConsumerTests(unittest.TestCase):
         client.consume.return_value = [self.kafka_record()]
         client.commit.return_value = [SimpleNamespace(error=None)]
         with patch.dict('sys.modules', {'oci': self.oci, 'confluent_kafka': kafka}):
-            output = self.cli(['events', '--group-name', 'group', '--kafka', '--endpoint', 'private',
+            output = self.cli(['events', '--group-name', 'group', '--api', 'kafka-python', '--endpoint', 'private',
                                '--workers', '1', '--max-messages', '1', '--request-rate', '1000'],
                               {'OCI_KAFKA_USERNAME': 'tenant/user/pool', 'OCI_KAFKA_AUTH_TOKEN': 'secret-token'})
         message = json.loads(output)
@@ -217,18 +218,17 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(output, '')
 
     def test_kafka_dry_run_needs_no_token_and_rejects_unsupported_options(self):
-        output = self.cli(['events', '--group-name', 'group', '--kafka', '--dry-run'])
+        output = self.cli(['events', '--group-name', 'group', '--api', 'kafka-python', '--dry-run'])
         self.assertIn('Kafka SASL_SSL/PLAIN', output)
-        for options in (['--cursor-type', 'AT_TIME', '--time', '2026-11-09T00:00:00Z'],
-                        ['--endpoint', 'https://messages.example.com']):
+        for options in (['--endpoint', 'https://messages.example.com'],):
             with self.subTest(options=options), self.assertRaises(SystemExit) as error:
-                self.cli(['events', '--group-name', 'group', '--kafka', '--dry-run', *options])
+                self.cli(['events', '--group-name', 'group', '--api', 'kafka-python', '--dry-run', *options])
             self.assertEqual(error.exception.code, 2)
 
     def test_kafka_requires_user_and_token(self):
         for env in ({}, {'OCI_KAFKA_USERNAME': 'tenant/user/pool'}):
             with self.subTest(env=env), self.assertRaises(SystemExit) as error:
-                self.cli(['events', '--group-name', 'group', '--kafka'], env)
+                self.cli(['events', '--group-name', 'group', '--api', 'kafka-python'], env)
             self.assertEqual(error.exception.code, 2)
 
     def test_kafka_latest_config(self):
@@ -237,6 +237,71 @@ class ConsumerTests(unittest.TestCase):
         with patch.dict(os.environ, {'OCI_KAFKA_AUTH_TOKEN': 'token'}):
             config = CONSUMER['kafka_config'](args, 'host:9092', 'worker-0')
         self.assertEqual(config['auto.offset.reset'], 'latest')
+
+    def test_api_oci_is_default_and_old_kafka_switch_is_removed(self):
+        default = self.cli(['events', '--group-name', 'group', '--dry-run'])
+        explicit = self.cli(['events', '--group-name', 'group', '--api', 'oci', '--dry-run'])
+        self.assertEqual(default, explicit)
+        with self.assertRaises(SystemExit) as error:
+            self.cli(['events', '--group-name', 'group', '--kafka', '--dry-run'])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_all_api_modes_accept_shared_controls_and_at_time(self):
+        for api in ('oci', 'kafka-python', 'kafka-java'):
+            with self.subTest(api=api):
+                output = self.cli(['events', '--api', api, '--group-name', 'group', '--endpoint', 'private',
+                    '--workers', '2', '--batch-size', '50', '--request-rate', '1', '--max-messages', '100',
+                    '--duration', '60', '--no-print-messages', '--cursor-type', 'AT_TIME',
+                    '--time', '2026-11-09T00:00:00Z', '--json-report', '/tmp/unused-report.json', '--dry-run'])
+                self.assertIn('api=' + api, output)
+                self.assertIn('message output: False', output)
+                self.assertIn('Duration: 60s', output)
+
+    def test_java_backend_dispatch_uses_shared_processing_and_closes_client(self):
+        stream = SimpleNamespace(name='events', id='stream', lifecycle_state='ACTIVE', stream_pool_id='pool')
+        self.oci.pagination.list_call_get_all_results.return_value.data = [stream]
+        admin = self.oci.streaming.StreamAdminClient.return_value
+        admin.get_stream_pool.return_value.data = SimpleNamespace(is_private=True,
+            kafka_settings=SimpleNamespace(bootstrap_servers='host:9092'))
+        client = Mock()
+        client.consume.return_value = [self.kafka_record()]
+        client.commit.return_value = []
+        factory = Mock(return_value=client)
+        with patch.dict(CONSUMER, {'JavaKafkaClient': factory}), patch.dict('sys.modules', {'oci': self.oci, 'confluent_kafka': None}):
+            output = self.cli(['events', '--api', 'kafka-java', '--group-name', 'group', '--endpoint', 'private',
+                '--workers', '1', '--max-messages', '1', '--request-rate', '1000'],
+                {'OCI_KAFKA_USERNAME': 'tenant/user/pool', 'OCI_KAFKA_AUTH_TOKEN': 'secret-token'})
+        self.assertEqual(json.loads(output)['value'], 'aGVsbG8gd2...')
+        self.assertEqual(factory.call_args.args[1], 'host:9092')
+        self.assertEqual(factory.call_args.args[0].api, 'kafka-java')
+        offset = client.commit.call_args.kwargs['offsets'][0]
+        self.assertEqual((offset.topic, offset.partition, offset.offset), ('events', 0, 2))
+        client.close.assert_called_once()
+        self.oci.streaming.StreamClient.assert_not_called()
+
+    def test_python_at_time_only_seeks_partitions_without_commits(self):
+        kafka, client = Mock(), Mock()
+        kafka.TopicPartition.side_effect = lambda topic, partition, offset: SimpleNamespace(topic=topic, partition=partition, offset=offset)
+        kafka.OFFSET_END = -1
+        self.args.api = 'kafka-python'
+        self.args.stream_name = 'events'
+        self.args.cursor_type = 'AT_TIME'
+        self.args.request_timeout = 30
+        self.args.time = datetime(2026, 11, 9, tzinfo=timezone.utc)
+        partitions = [SimpleNamespace(topic='events', partition=i, offset=-1001) for i in range(2)]
+        client.committed.return_value = [SimpleNamespace(offset=5, error=None), SimpleNamespace(offset=-1001, error=None)]
+        client.offsets_for_times.return_value = [SimpleNamespace(offset=20, error=None)]
+        client.subscribe.side_effect = lambda topics, on_assign: on_assign(client, partitions)
+        client.consume.return_value = [self.kafka_record()]
+        client.commit.return_value = []
+        state = CONSUMER['State'](1, request_rate=10000)
+        CONSUMER['kafka_worker'](kafka, client, self.args, state, threading.Event(), time.monotonic() + 1, 'worker-0', threading.Lock())
+        self.assertFalse(state.errors)
+        self.assertEqual([p.offset for p in client.assign.call_args.args[0]], [5, 20])
+        lookup = client.offsets_for_times.call_args.args[0]
+        self.assertEqual(len(lookup), 1)
+        self.assertEqual(lookup[0].partition, 1)
+        self.assertEqual(lookup[0].offset, int(self.args.time.timestamp() * 1000))
 
     def test_message_output_can_be_disabled(self):
         output = self.cli(['events', '--group-name', 'group', '--dry-run', '--no-print-messages'])
@@ -262,7 +327,7 @@ class ConsumerTests(unittest.TestCase):
 
     def test_continuous_run_has_no_deadline_and_drains_on_interrupt(self):
         args = SimpleNamespace(max_messages=None, request_rate=2, duration=None, workers=1,
-                               instance_name=None, kafka=False, report_interval=5, json_report=None)
+                               instance_name=None, api='oci', report_interval=5, json_report=None)
         previous_handler = signal.getsignal(signal.SIGINT)
         def idle_worker(oci, client, args, state, stop, deadline, instance_name, output_lock):
             self.assertEqual(deadline, float('inf'))
@@ -276,7 +341,7 @@ class ConsumerTests(unittest.TestCase):
 
     def test_explicit_duration_stops_empty_stream(self):
         args = SimpleNamespace(max_messages=None, request_rate=10000, duration=.03, workers=1,
-                               instance_name=None, kafka=False, report_interval=5, json_report=None,
+                               instance_name=None, api='oci', report_interval=5, json_report=None,
                                group_name='group', stream_id='stream', cursor_type='TRIM_HORIZON',
                                time=None, batch_size=1000, print_messages=False, poll_interval=.001)
         self.client.get_messages.return_value.data = []
