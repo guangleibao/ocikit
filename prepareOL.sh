@@ -19,7 +19,7 @@ sudo dnf install -y oracle-epel-release-el9
 sudo dnf --enablerepo=ol9_developer_EPEL install -y htop sysstat git
 
 # Provision the stream runtime with uv (independent of the OCI CLI's Python).
-sudo dnf install -y curl ca-certificates
+sudo dnf install -y curl ca-certificates jq
 export PATH="$HOME/.local/bin:$PATH"
 if ! command -v uv >/dev/null 2>&1; then
     OCIKIT_UV_INSTALLER=$(mktemp)

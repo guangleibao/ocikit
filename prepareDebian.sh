@@ -13,7 +13,7 @@ fi
 rm -rf /home/debian/lib/oracle-cli
 sudo apt update -y
 sudo apt upgrade -y
-sudo apt install -y curl ca-certificates python3 python3-venv htop sysstat
+sudo apt install -y curl ca-certificates jq python3 python3-venv htop sysstat
 curl -fsSL \
   https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh \
   -o /tmp/install-oci-cli.sh
