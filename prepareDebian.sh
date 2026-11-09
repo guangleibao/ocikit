@@ -10,7 +10,7 @@ if [ -f "$OCIKIT_DIR/.env" ]; then
     set +a
 fi
 
-
+rm -rf /home/debian/lib/oracle-cli
 sudo apt update -y
 sudo apt upgrade -y
 sudo apt install -y curl ca-certificates python3 python3-venv htop sysstat
