@@ -10,15 +10,22 @@ if [ -f "$OCIKIT_DIR/.env" ]; then
     set +a
 fi
 
-if [ -f .venv/bin/activate ]; then
-    . ./.venv/bin/activate
+# Select the interpreter directly: activation scripts can depend on Bash variables
+# such as OSTYPE and are unnecessary when launching an environment's Python.
+OCIKIT_PYTHON=
+if [ -d .venv ]; then
+    OCIKIT_PYTHON="$(pwd)/.venv/bin/python"
+elif [ -n "${VIRTUAL_ENV:-}" ]; then
+    OCIKIT_PYTHON="$VIRTUAL_ENV/bin/python"
+elif [ -d "$OCIKIT_DIR/.venv" ]; then
+    OCIKIT_PYTHON="$OCIKIT_DIR/.venv/bin/python"
 fi
-if [ -n "${VIRTUAL_ENV:-}" ]; then
-    if [ ! -x "$VIRTUAL_ENV/bin/python" ]; then
-        echo "Error: virtual environment has no executable Python: $VIRTUAL_ENV/bin/python" >&2
+if [ -n "$OCIKIT_PYTHON" ]; then
+    if [ ! -x "$OCIKIT_PYTHON" ]; then
+        echo "Error: virtual environment has no executable Python: $OCIKIT_PYTHON" >&2
         exit 127
     fi
-    set -- "$VIRTUAL_ENV/bin/python" - "$@"
+    set -- "$OCIKIT_PYTHON" - "$@"
 else
     if ! command -v uv >/dev/null 2>&1; then
         echo "Error: activate a Python environment with OCI SDK installed, or make uv available on PATH." >&2

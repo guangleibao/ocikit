@@ -11,17 +11,22 @@ if [ -f "$OCIKIT_DIR/.env" ]; then
     set +a
 fi
 
-if [ -f .venv/bin/activate ]; then
-    . ./.venv/bin/activate
-elif [ -z "${VIRTUAL_ENV:-}" ] && [ -f "$OCIKIT_DIR/.venv/bin/activate" ]; then
-    . "$OCIKIT_DIR/.venv/bin/activate"
+# Select the interpreter directly: activation scripts can depend on Bash variables
+# such as OSTYPE and are unnecessary when launching an environment's Python.
+OCIKIT_PYTHON=
+if [ -d .venv ]; then
+    OCIKIT_PYTHON="$(pwd)/.venv/bin/python"
+elif [ -n "${VIRTUAL_ENV:-}" ]; then
+    OCIKIT_PYTHON="$VIRTUAL_ENV/bin/python"
+elif [ -d "$OCIKIT_DIR/.venv" ]; then
+    OCIKIT_PYTHON="$OCIKIT_DIR/.venv/bin/python"
 fi
-if [ -n "${VIRTUAL_ENV:-}" ]; then
-    if [ ! -x "$VIRTUAL_ENV/bin/python" ]; then
-        echo "Error: virtual environment has no executable Python: $VIRTUAL_ENV/bin/python" >&2
+if [ -n "$OCIKIT_PYTHON" ]; then
+    if [ ! -x "$OCIKIT_PYTHON" ]; then
+        echo "Error: virtual environment has no executable Python: $OCIKIT_PYTHON" >&2
         exit 127
     fi
-    set -- "$VIRTUAL_ENV/bin/python" - "$@"
+    set -- "$OCIKIT_PYTHON" - "$@"
 else
     if ! command -v uv >/dev/null 2>&1; then
         echo "Error: activate a Python environment with OCI SDK installed, or make uv available on PATH." >&2
@@ -502,13 +507,17 @@ def positive_float(value):
 
 
 def resolve_stream(oci, admin, args):
-    print(f'Resolving stream name {args.stream_name!r} in the configured compartment...', file=sys.stderr, flush=True)
+    print(f'Resolving stream name {args.stream_name!r}; region={args.region}; '
+          f'compartment={args.compartment_id} (exact compartment, no child compartments)...', file=sys.stderr, flush=True)
     streams = oci.pagination.list_call_get_all_results(admin.list_streams,
         compartment_id=args.compartment_id, name=args.stream_name, lifecycle_state='ACTIVE',
         retry_strategy=oci.retry.NoneRetryStrategy()).data
     matches = [stream for stream in streams if stream.name == args.stream_name and stream.lifecycle_state == 'ACTIVE']
     if not matches:
-        raise RuntimeError(f'No ACTIVE stream named {args.stream_name!r} found in the selected scope.')
+        raise RuntimeError(f'No ACTIVE stream named {args.stream_name!r} found in compartment '
+            f'{args.compartment_id!r}, region {args.region!r}. Check the exact stream name, '
+            'OCI_COMPARTMENT_ID, OCI_REGION/--region, lifecycle state, and instance-principal '
+            'read permissions. Child compartments are not searched.')
     if args.endpoint in ('private', 'public'):
         pools = {}
         selected = []
@@ -647,7 +656,8 @@ def main(argv=None):
         signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner(
             retry_strategy=oci.retry.NoneRetryStrategy(),
             federation_client_retry_strategy=oci.retry.NoneRetryStrategy())
-        config = {'region': args.region or signer.region}
+        args.region = args.region or signer.region
+        config = {'region': args.region}
         common = {'signer': signer, 'timeout': (args.connect_timeout, args.request_timeout),
                   'retry_strategy': oci.retry.NoneRetryStrategy()}
         endpoint = None if args.endpoint in ('private', 'public') else args.endpoint

@@ -330,6 +330,16 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(request.call_args.kwargs['stream_pool_id'], 'pool')
         self.assertNotIn('token', request.call_args.kwargs)
 
+    def test_missing_stream_error_identifies_lookup_scope(self):
+        self.oci.pagination.list_call_get_all_results.return_value.data = []
+        args = SimpleNamespace(stream_name='demo-stream', compartment_id='configured-compartment',
+                               region='us-ashburn-1', endpoint='private')
+        with redirect_stderr(io.StringIO()), self.assertRaises(RuntimeError) as error:
+            CONSUMER['resolve_stream'](self.oci, Mock(), args)
+        for detail in ('demo-stream', 'configured-compartment', 'us-ashburn-1',
+                       'OCI_REGION/--region', 'read permissions', 'Child compartments are not searched'):
+            self.assertIn(detail, str(error.exception))
+
     def test_python_at_time_only_seeks_partitions_without_commits(self):
         kafka, client = Mock(), Mock()
         kafka.TopicPartition.side_effect = lambda topic, partition, offset: SimpleNamespace(topic=topic, partition=partition, offset=offset)
