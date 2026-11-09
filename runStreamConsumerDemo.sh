@@ -60,10 +60,14 @@ Use --no-print-messages to consume without printing messages.
 
 --api oci (default) uses OCI's Python SDK. --api kafka-python uses the Python
 confluent-kafka client; --api kafka-java uses Apache Kafka's Java client. Both
-Kafka modes use OCI's Kafka compatibility endpoint over SASL_SSL/PLAIN. Discovery
+Kafka modes use OCI's Kafka compatibility endpoint over SASL_SSL. Discovery
 still uses instance principals and requires read stream-pools. Set
 OCI_KAFKA_USERNAME to tenancyName/[domain/]username/streamPoolId and
-OCI_KAFKA_AUTH_TOKEN to the OCI user's auth token in .env. Bootstrap servers
+OCI_KAFKA_AUTH_TOKEN to the OCI user's auth token in .env for SASL/PLAIN.
+Java Kafka uses instance principals (OCI_RSA_SHA256) when no Kafka username is
+provided; no auth token is needed in that case. Python Kafka requires a username
+and auth token. The instance's dynamic group must be allowed to consume streams.
+Bootstrap servers
 are discovered from the stream pool; OCI_KAFKA_BOOTSTRAP_SERVERS overrides them.
 Kafka maps TRIM_HORIZON to earliest and supports AT_TIME for partitions without
 committed offsets. Existing committed offsets are preserved in every mode.
@@ -373,6 +377,7 @@ class JavaKafkaClient:
             stdout=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
         try:
             self._request('init', bootstrap=bootstrap_servers, username=args.kafka_username,
+                stream_pool_id=args.stream_pool_id,
                 group=args.group_name, instance=instance_name, batch_size=args.batch_size,
                 cursor_type=args.cursor_type, timestamp_ms=int(args.time.timestamp() * 1000) if args.time else None,
                 connect_timeout_ms=max(1000, int(args.connect_timeout * 1000)),
@@ -547,7 +552,7 @@ def main(argv=None):
     parser.add_argument('--api', choices=('oci', 'kafka-python', 'kafka-java'), default='oci',
                         help='consumer implementation (default: oci)')
     parser.add_argument('--kafka-username', default=os.getenv('OCI_KAFKA_USERNAME') or None,
-                        help='tenancyName/[domain/]username/streamPoolId (default: OCI_KAFKA_USERNAME)')
+                        help='tenancyName/[domain/]username/streamPoolId (default: OCI_KAFKA_USERNAME; Java uses instance principals when absent)')
     parser.add_argument('--kafka-bootstrap-servers', default=os.getenv('OCI_KAFKA_BOOTSTRAP_SERVERS') or None,
                         help='Kafka host:port list (default: OCI_KAFKA_BOOTSTRAP_SERVERS, otherwise discover from pool)')
     parser.add_argument('--endpoint', default=os.getenv('OCI_STREAM_ENDPOINT') or None,
@@ -574,6 +579,7 @@ def main(argv=None):
     parser.add_argument('--debug', action='store_true', help='enable SDK debug logging')
     parser.add_argument('--dry-run', action='store_true', help='show plan without importing OCI, authenticating or consuming')
     args = parser.parse_args(argv)
+    args.kafka_username = (args.kafka_username or '').strip() or None
     for value, setting in ((args.stream_name, 'OCI_STREAM_NAME or provide a stream name'),
                            (args.group_name, 'OCI_STREAM_GROUP_NAME or provide --group-name')):
         if not value or not value.strip():
@@ -593,11 +599,11 @@ def main(argv=None):
         parser.error('--time is required with AT_TIME and only valid with AT_TIME')
     if (args.api != 'oci') and args.endpoint and args.endpoint not in ('private', 'public'):
         parser.error('Kafka APIs use --endpoint private|public; use --kafka-bootstrap-servers for a host:port override')
-    if (args.api != 'oci') and not args.dry_run:
-        if not args.kafka_username or not args.kafka_username.strip():
-            parser.error('set OCI_KAFKA_USERNAME or provide --kafka-username for Kafka APIs')
-        if not os.getenv('OCI_KAFKA_AUTH_TOKEN'):
-            parser.error('set OCI_KAFKA_AUTH_TOKEN in .env for Kafka APIs')
+    if args.api != 'oci' and not args.dry_run:
+        if args.api == 'kafka-python' and not args.kafka_username:
+            parser.error('set OCI_KAFKA_USERNAME or provide --kafka-username for Python Kafka')
+        if args.kafka_username and not os.getenv('OCI_KAFKA_AUTH_TOKEN'):
+            parser.error('set OCI_KAFKA_AUTH_TOKEN in .env when using a Kafka username')
     if args.endpoint and args.endpoint not in ('private', 'public'):
         endpoint = urlsplit(args.endpoint)
         if (endpoint.scheme != 'https' or not endpoint.hostname or endpoint.username or endpoint.password or
@@ -610,8 +616,11 @@ def main(argv=None):
             endpoint_plan = f'discover {args.endpoint} endpoint using stream pool type'
         print(f'Dry run: api={args.api}; instance-principal discovery; stream name={args.stream_name}')
         print(f'Endpoint: {endpoint_plan}; lookup scope: configured compartment (.env)')
-        if (args.api != 'oci'):
+        if args.api == 'kafka-java' and not args.kafka_username:
+            print('Protocol: Kafka SASL_SSL/OCI_RSA_SHA256; instance-principal authentication (no auth token needed)')
+        elif args.api != 'oci':
             print('Protocol: Kafka SASL_SSL/PLAIN; user auth token required via OCI_KAFKA_AUTH_TOKEN')
+        if args.api != 'oci':
             print('Kafka bootstrap: ' + (args.kafka_bootstrap_servers or 'discover from stream pool Kafka settings'))
         print(f'Group: {args.group_name}; instance prefix: {args.instance_name or "random UUID"}; workers: {args.workers}')
         print(f'New group position: {args.cursor_type}; time: {args.time}; existing group: resume committed offsets')
@@ -646,10 +655,11 @@ def main(argv=None):
         try:
             stream = resolve_stream(oci, admin, args)
             args.stream_id = stream.id
+            args.stream_pool_id = stream.stream_pool_id
             print(f'Stream: {stream.name}; ID: {stream.id}', file=sys.stderr, flush=True)
             if (args.api != 'oci'):
                 pool = admin.get_stream_pool(stream.stream_pool_id, retry_strategy=oci.retry.NoneRetryStrategy()).data
-                if not args.kafka_username.endswith('/' + stream.stream_pool_id):
+                if args.kafka_username and not args.kafka_username.endswith('/' + stream.stream_pool_id):
                     raise RuntimeError('Kafka username must end with / followed by the selected stream pool OCID.')
                 endpoint = args.kafka_bootstrap_servers or pool.kafka_settings.bootstrap_servers
             elif not endpoint:
@@ -663,6 +673,9 @@ def main(argv=None):
         if not endpoint:
             raise RuntimeError('Stream has no messages endpoint; specify --endpoint.')
         print(f'{"Kafka bootstrap" if args.api != "oci" else "Messages endpoint"}: {endpoint}; group: {args.group_name}; workers: {args.workers}', file=sys.stderr, flush=True)
+        if args.api == 'kafka-java':
+            print('Java Kafka authentication: ' + ('SASL/PLAIN (user auth token)' if args.kafka_username
+                else 'instance principals (OCI_RSA_SHA256)'), file=sys.stderr, flush=True)
         clients = []
         run_id = uuid.uuid4().hex
         print(f'Pacing: {args.request_rate:g} application calls/sec across {args.workers} worker(s), including commits',

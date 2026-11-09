@@ -1,6 +1,7 @@
 package ocikit;
 
 import com.google.gson.*;
+import com.oracle.bmc.auth.sasl.OciMechanism;
 import org.apache.kafka.clients.consumer.*;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
@@ -28,15 +29,26 @@ public final class KafkaConsumerBridge implements AutoCloseable {
     }
 
     static Properties properties(JsonObject config, String token) {
-        if (token == null || token.isEmpty()) throw new IllegalArgumentException("OCI_KAFKA_AUTH_TOKEN is required");
         Properties props = new Properties();
         props.put("bootstrap.servers", config.get("bootstrap").getAsString());
         props.put("group.id", config.get("group").getAsString());
         props.put("client.id", config.get("instance").getAsString());
         props.put("security.protocol", "SASL_SSL");
-        props.put("sasl.mechanism", "PLAIN");
-        props.put("sasl.jaas.config", "org.apache.kafka.common.security.plain.PlainLoginModule required username="
-            + quoted(config.get("username").getAsString()) + " password=" + quoted(token) + ";");
+        String username = config.has("username") && !config.get("username").isJsonNull()
+            ? config.get("username").getAsString().trim() : "";
+        if (!username.isEmpty()) {
+            if (token == null || token.isEmpty()) throw new IllegalArgumentException("OCI_KAFKA_AUTH_TOKEN is required with a Kafka username");
+            props.put("sasl.mechanism", "PLAIN");
+            props.put("sasl.jaas.config", "org.apache.kafka.common.security.plain.PlainLoginModule required username="
+                + quoted(username) + " password=" + quoted(token) + ";");
+        } else {
+            if (!config.has("stream_pool_id") || config.get("stream_pool_id").isJsonNull()
+                || config.get("stream_pool_id").getAsString().trim().isEmpty())
+                throw new IllegalArgumentException("stream_pool_id is required for instance principals");
+            props.put("sasl.mechanism", OciMechanism.OCI_RSA_SHA256.mechanismName());
+            props.put("sasl.jaas.config", "com.oracle.bmc.auth.sasl.InstancePrincipalsLoginModule required intent="
+                + quoted("streamPoolId:" + config.get("stream_pool_id").getAsString()) + ";");
+        }
         props.put("enable.auto.commit", "false");
         props.put("allow.auto.create.topics", "false");
         props.put("key.deserializer", ByteArrayDeserializer.class.getName());

@@ -1,6 +1,7 @@
 package ocikit;
 
 import com.google.gson.*;
+import com.oracle.bmc.auth.sasl.OciMechanism;
 import org.apache.kafka.clients.consumer.*;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.Test;
@@ -46,6 +47,28 @@ class KafkaConsumerBridgeTest {
         assertEquals("latest", props.get("auto.offset.reset"));
         assertTrue(props.getProperty("sasl.jaas.config").contains("password=\"token\\\\\\\"quoted\""));
         assertDoesNotThrow(() -> new ConsumerConfig(props));
+    }
+
+    @Test void instancePrincipalsNeedPoolIntentButNoUsernameOrToken() throws Exception {
+        JsonObject config = command("{bootstrap:'host:9092',group:'group',instance:'worker-0',stream_pool_id:'ocid1.streampool.test',cursor_type:'TRIM_HORIZON',batch_size:1000,connect_timeout_ms:5000,request_timeout_ms:30000}");
+        Properties props = KafkaConsumerBridge.properties(config, null);
+        assertEquals(OciMechanism.OCI_RSA_SHA256.mechanismName(), props.get("sasl.mechanism"));
+        assertEquals("SASL_SSL", props.get("security.protocol"));
+        assertEquals("com.oracle.bmc.auth.sasl.InstancePrincipalsLoginModule required intent=\"streamPoolId:ocid1.streampool.test\";",
+            props.get("sasl.jaas.config"));
+        assertFalse(props.getProperty("sasl.jaas.config").contains("password"));
+        assertEquals(props, KafkaConsumerBridge.properties(config, "unused-token"));
+        assertDoesNotThrow(() -> new ConsumerConfig(props));
+        // Loading the module registers the OCI SASL provider without contacting instance metadata.
+        Class.forName("com.oracle.bmc.auth.sasl.InstancePrincipalsLoginModule");
+        assertTrue(ServiceLoader.load(com.oracle.bmc.http.client.HttpProvider.class).iterator().hasNext());
+        config.remove("stream_pool_id");
+        assertThrows(IllegalArgumentException.class, () -> KafkaConsumerBridge.properties(config, null));
+    }
+
+    @Test void configuredUsernameRequiresTokenRatherThanSilentlyFallingBack() {
+        JsonObject config = command("{bootstrap:'host:9092',group:'group',instance:'worker-0',username:'tenant/user/pool',cursor_type:'LATEST',batch_size:1000,connect_timeout_ms:5000,request_timeout_ms:30000}");
+        assertThrows(IllegalArgumentException.class, () -> KafkaConsumerBridge.properties(config, null));
     }
 
     @Test void emptyReadsDoNotCommitAndInvalidOperationsFail() {

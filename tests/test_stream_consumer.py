@@ -279,6 +279,57 @@ class ConsumerTests(unittest.TestCase):
         client.close.assert_called_once()
         self.oci.streaming.StreamClient.assert_not_called()
 
+    def test_java_without_username_runs_with_instance_principal_discovery(self):
+        for env in ({}, {'OCI_KAFKA_AUTH_TOKEN': 'unused-token'}, {'OCI_KAFKA_USERNAME': '  '}):
+            with self.subTest(env=env):
+                stream = SimpleNamespace(name='events', id='stream', lifecycle_state='ACTIVE', stream_pool_id='pool')
+                self.oci.pagination.list_call_get_all_results.return_value.data = [stream]
+                admin = self.oci.streaming.StreamAdminClient.return_value
+                admin.get_stream_pool.return_value.data = SimpleNamespace(is_private=True,
+                    kafka_settings=SimpleNamespace(bootstrap_servers='host:9092'))
+                client = Mock()
+                client.consume.return_value = [self.kafka_record()]
+                client.commit.return_value = []
+                factory = Mock(return_value=client)
+                with patch.dict(CONSUMER, {'JavaKafkaClient': factory}), patch.dict('sys.modules', {'oci': self.oci}):
+                    output = self.cli(['events', '--api', 'kafka-java', '--group-name', 'group',
+                        '--workers', '1', '--max-messages', '1', '--request-rate', '1000'], env)
+                self.assertIsNone(factory.call_args.args[0].kafka_username)
+                self.assertEqual(factory.call_args.args[0].stream_pool_id, 'pool')
+                self.assertIn('instance principals (OCI_RSA_SHA256)', self.stderr_output)
+                self.assertEqual(json.loads(output)['offset'], 1)
+                client.close.assert_called_once()
+
+    def test_java_username_from_cli_or_environment_still_requires_token(self):
+        for options, env in (([], {'OCI_KAFKA_USERNAME': 'tenant/user/pool'}),
+                             (['--kafka-username', 'tenant/user/pool'], {})):
+            with self.subTest(options=options), self.assertRaises(SystemExit) as error:
+                self.cli(['events', '--api', 'kafka-java', '--group-name', 'group', *options], env)
+            self.assertEqual(error.exception.code, 2)
+
+    def test_java_dry_run_reports_selected_authentication(self):
+        output = self.cli(['events', '--api', 'kafka-java', '--group-name', 'group', '--dry-run'])
+        self.assertIn('SASL_SSL/OCI_RSA_SHA256', output)
+        self.assertIn('no auth token needed', output)
+        output = self.cli(['events', '--api', 'kafka-java', '--group-name', 'group', '--dry-run',
+                           '--kafka-username', 'tenant/user/pool'])
+        self.assertIn('SASL_SSL/PLAIN', output)
+
+    def test_java_bridge_receives_discovered_pool_without_credentials(self):
+        args = SimpleNamespace(request_timeout=30, connect_timeout=5, poll_interval=1, kafka_username=None,
+            stream_pool_id='pool', group_name='group', batch_size=1000, cursor_type='TRIM_HORIZON',
+            time=None, debug=False)
+        client_type = CONSUMER['JavaKafkaClient']
+        with patch.object(client_type, '_request', return_value={}) as request, \
+                patch.object(CONSUMER['shutil'], 'which', return_value='/java'), \
+                patch.object(Path, 'is_file', return_value=True), \
+                patch.object(CONSUMER['subprocess'], 'Popen'):
+            client = client_type(args, 'host:9092', 'worker-0')
+        self.assertEqual(request.call_args.args, ('init',))
+        self.assertIsNone(request.call_args.kwargs['username'])
+        self.assertEqual(request.call_args.kwargs['stream_pool_id'], 'pool')
+        self.assertNotIn('token', request.call_args.kwargs)
+
     def test_python_at_time_only_seeks_partitions_without_commits(self):
         kafka, client = Mock(), Mock()
         kafka.TopicPartition.side_effect = lambda topic, partition, offset: SimpleNamespace(topic=topic, partition=partition, offset=offset)
