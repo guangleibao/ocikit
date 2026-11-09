@@ -20,6 +20,14 @@ CONSUMER = {'__name__': 'stream_consumer'}
 exec(compile(SOURCE, str(SCRIPT), 'exec'), CONSUMER)
 
 
+class ServiceFailure(Exception):
+    def __init__(self, status):
+        super().__init__('simulated service failure')
+        self.status = status
+        self.code = 'ServiceUnavailable' if status == 503 else 'TestError'
+        self.headers = {}
+
+
 class ConsumerTests(unittest.TestCase):
     def setUp(self):
         self.oci = Mock()
@@ -77,6 +85,40 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual((snapshot['consumed'], snapshot['committed']), (1, 0))
         self.assertIn('commit failed', snapshot['errors'][0])
         self.client.get_messages.assert_called_once()
+
+    def test_transient_failures_recover_and_empty_reads_wait_for_new_messages(self):
+        initial = self.client.create_group_cursor.return_value
+        committed = self.client.consumer_commit.return_value
+        messages = self.client.get_messages.return_value
+        self.client.create_group_cursor.side_effect = [ServiceFailure(503), ServiceFailure(503), initial]
+        self.client.get_messages.side_effect = [ServiceFailure(503),
+            SimpleNamespace(data=[], headers={'opc-next-cursor': 'empty-next'}), messages]
+        self.client.consumer_commit.side_effect = [ServiceFailure(503), committed]
+        with patch.object(CONSUMER['random'], 'uniform', return_value=0), redirect_stderr(io.StringIO()) as output:
+            snapshot = self.run_worker()
+        self.assertEqual((snapshot['consumed'], snapshot['committed']), (1, 1))
+        self.assertEqual(snapshot['retries'], 4)
+        self.assertFalse(snapshot['errors'])
+        self.assertIn('Retrying create_group_cursor', output.getvalue())
+        self.assertEqual([call.args[1] for call in self.client.get_messages.call_args_list],
+                         ['initial', 'initial', 'empty-next'])
+        self.assertEqual([call.args[1] for call in self.client.consumer_commit.call_args_list], ['next', 'next'])
+
+    def test_permanent_authentication_failure_is_not_retried(self):
+        self.client.create_group_cursor.side_effect = ServiceFailure(401)
+        snapshot = self.run_worker()
+        self.assertTrue(snapshot['errors'])
+        self.assertEqual(snapshot['retries'], 0)
+        self.client.create_group_cursor.assert_called_once()
+
+    def test_network_failure_is_retried(self):
+        self.client.create_group_cursor.side_effect = [ConnectionError('connection lost'),
+                                                       self.client.create_group_cursor.return_value]
+        with patch.object(CONSUMER['random'], 'uniform', return_value=0), redirect_stderr(io.StringIO()):
+            snapshot = self.run_worker()
+        self.assertEqual(snapshot['committed'], 1)
+        self.assertEqual(snapshot['retries'], 1)
+        self.assertFalse(snapshot['errors'])
 
     def test_global_capacity_reservations(self):
         state = CONSUMER['State'](3)
@@ -481,6 +523,53 @@ class PacingTests(unittest.TestCase):
         self.assertEqual(state.committed, 1)
         self.assertFalse(state.errors)
         self.assertGreaterEqual(time.monotonic() - started, .045)
+
+
+class RetryTests(unittest.TestCase):
+    def test_persistent_failure_respects_stop_and_does_not_busy_loop(self):
+        stop = Mock()
+        stop.is_set.return_value = False
+        stop.wait.return_value = True  # Simulate Ctrl-C arriving during backoff.
+        state = CONSUMER['State'](None)
+        state.pacer = Mock()
+        call = Mock(side_effect=ServiceFailure(503))
+        with redirect_stderr(io.StringIO()), self.assertRaises(CONSUMER['RetryCancelled']):
+            CONSUMER['rest_request'](Mock(), 'create_group_cursor', call, state, stop,
+                                      float('inf'), 'worker-0', threading.Lock())
+        call.assert_called_once()
+        self.assertGreaterEqual(stop.wait.call_args.args[0], .5)
+
+    def test_persistent_commit_failure_has_bounded_retry_window(self):
+        now = [0.0]
+        clock = SimpleNamespace(monotonic=lambda: now[0])
+        stop = Mock()
+        stop.is_set.return_value = False
+        stop.wait.side_effect = lambda delay: now.__setitem__(0, now[0] + delay) or False
+        state = CONSUMER['State'](None)
+        state.pacer = Mock()
+        call = Mock(side_effect=ServiceFailure(503))
+        with patch.dict(CONSUMER, {'time': clock}), patch.object(CONSUMER['random'], 'uniform', side_effect=lambda low, high: high), \
+                redirect_stderr(io.StringIO()), self.assertRaises(ServiceFailure):
+            CONSUMER['rest_request'](Mock(), 'consumer_commit', call, state, stop,
+                                      float('inf'), 'worker-0', threading.Lock(), commit=True)
+        self.assertEqual(now[0], 25)
+        self.assertLessEqual(call.call_count, 7)
+
+    def test_retry_after_header_and_rate_cap_apply_to_each_attempt(self):
+        stop = Mock()
+        stop.is_set.return_value = False
+        stop.wait.return_value = False
+        state = CONSUMER['State'](None)
+        state.pacer = Mock()
+        error = ServiceFailure(429)
+        error.headers['retry-after'] = '5'
+        call = Mock(side_effect=[error, 'ok'])
+        with redirect_stderr(io.StringIO()):
+            result = CONSUMER['rest_request'](Mock(), 'get_messages', call, state, stop,
+                                              float('inf'), 'worker-0', threading.Lock())
+        self.assertEqual(result, 'ok')
+        stop.wait.assert_called_once_with(5)
+        self.assertEqual(state.pacer.wait.call_count, 2)
 
 
 if __name__ == '__main__':

@@ -53,7 +53,9 @@ start at TRIM_HORIZON by default. Existing groups resume committed offsets;
 
 Each batch is processed (counted and printed by default) before an explicit offset
 commit. Delivery is at least once: a failure can cause messages to be read again.
-SDK calls are not retried automatically; errors stop the run with exit code 1.
+REST cursor creation and reads retry temporary service/network failures with
+exponential backoff and jitter until stopped. Commits retry for up to 25 seconds
+to avoid hanging shutdown; authentication and other permanent errors stop the run.
 By default, keep waiting for messages until Ctrl-C. An explicit --duration limits
 new reads; in-flight reads and commits drain to their timeouts. --max-messages
 also stops the run when the requested number of messages has been consumed.
@@ -95,6 +97,7 @@ import json
 import logging
 import math
 import os
+import random
 from pathlib import Path
 import signal
 import subprocess
@@ -153,6 +156,7 @@ class State:
         self.maximum = maximum
         self.reserved = 0
         self.consumed = self.committed = self.payload_bytes = self.requests = 0
+        self.retries = 0
         self.partitions = Counter()
         self.errors = []
 
@@ -182,13 +186,67 @@ class State:
         with self.lock:
             return dict(consumed=self.consumed, committed=self.committed,
                         payload_bytes=self.payload_bytes, requests=self.requests,
-                        partitions=dict(self.partitions), errors=list(self.errors))
+                        partitions=dict(self.partitions), errors=list(self.errors), retries=self.retries)
 
 
 def require_cursor(cursor):
     if not isinstance(cursor, str) or not cursor:
         raise RuntimeError('Streaming returned no usable cursor; stopping without another read.')
     return cursor
+
+
+class RetryCancelled(Exception):
+    """A retryable read or cursor operation was stopped before completion."""
+
+
+def rest_request(oci, operation, call, state, stop, deadline, instance_name, output_lock, commit=False):
+    """Retry the same operation/cursor; every attempt shares the request-rate cap."""
+    attempt = 0
+    retry_deadline = min(deadline, time.monotonic() + 25) if commit else deadline
+    last_error = None
+    while True:
+        # Always attempt the final commit once, even after a stop signal/deadline.
+        draining = commit and attempt == 0
+        if not state.pacer.wait(None if draining else stop, None if draining else retry_deadline):
+            if commit and last_error is not None:
+                raise last_error
+            raise RetryCancelled()
+        try:
+            return call()
+        except Exception as error:
+            status = getattr(error, 'status', None)
+            transient_service = isinstance(status, int) and (status in (408, 429) or 500 <= status < 600 and status != 501)
+            request_error = getattr(oci.exceptions, 'RequestException', None)
+            transient_network = isinstance(error, OSError) or (
+                isinstance(request_error, type) and isinstance(error, request_error))
+            if not (transient_service or transient_network):
+                raise
+            if stop.is_set() or time.monotonic() >= retry_deadline:
+                if commit:
+                    raise
+                raise RetryCancelled() from error
+            last_error = error
+            attempt += 1
+            base = min(30.0, 2.0 ** min(attempt - 1, 5))
+            delay = random.uniform(base / 2, base)
+            headers = getattr(error, 'headers', None) or {}
+            try:
+                retry_after = float(headers.get('retry-after', headers.get('Retry-After', 0)))
+                if math.isfinite(retry_after):
+                    delay = max(delay, retry_after)
+            except (TypeError, ValueError):
+                pass
+            delay = min(delay, max(0, retry_deadline - time.monotonic()))
+            with state.lock:
+                state.retries += 1
+            label = f'HTTP {status} {getattr(error, "code", "")}' if transient_service else type(error).__name__
+            with output_lock:
+                print(f'Retrying {operation} for {instance_name}: {label}; '
+                      f'attempt {attempt}; waiting {delay:.1f}s', file=sys.stderr, flush=True)
+            if stop.wait(delay):
+                if commit:
+                    raise last_error
+                raise RetryCancelled() from error
 
 
 def worker(oci, client, args, state, stop, deadline, instance_name, output_lock):
@@ -198,10 +256,10 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
         if args.time is not None:
             details['time'] = args.time
         retry = dict(retry_strategy=oci.retry.NoneRetryStrategy())
-        if not state.pacer.wait(stop, deadline):
-            return
-        cursor = require_cursor(client.create_group_cursor(args.stream_id,
-            oci.streaming.models.CreateGroupCursorDetails(**details), **retry).data.value)
+        group_details = oci.streaming.models.CreateGroupCursorDetails(**details)
+        cursor = require_cursor(rest_request(oci, 'create_group_cursor',
+            lambda: client.create_group_cursor(args.stream_id, group_details, **retry),
+            state, stop, deadline, instance_name, output_lock).data.value)
         while not stop.is_set() and time.monotonic() < deadline:
             limit = state.claim(args.batch_size)
             if limit is None:
@@ -210,9 +268,9 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
                 stop.wait(.1)
                 continue
             try:
-                if not state.pacer.wait(stop, deadline):
-                    return
-                response = client.get_messages(args.stream_id, cursor, limit=limit, **retry)
+                response = rest_request(oci, 'get_messages',
+                    lambda: client.get_messages(args.stream_id, cursor, limit=limit, **retry),
+                    state, stop, deadline, instance_name, output_lock)
                 messages = response.data
                 if messages is None or len(messages) > limit:
                     raise RuntimeError('Unexpected GetMessages batch; refusing to commit offsets.')
@@ -227,8 +285,9 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
                 state.record(messages, payload_bytes)
                 # Commit the returned cursor, including the last batch before stopping.
                 if messages:
-                    state.pacer.wait()  # Drain processed batches, including on interrupt/deadline.
-                    cursor = require_cursor(client.consumer_commit(args.stream_id, next_cursor, **retry).data.value)
+                    cursor = require_cursor(rest_request(oci, 'consumer_commit',
+                        lambda: client.consumer_commit(args.stream_id, next_cursor, **retry),
+                        state, stop, deadline, instance_name, output_lock, commit=True).data.value)
                     with state.lock:
                         state.committed += len(messages)
                 else:
@@ -237,6 +296,8 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
                 state.release(limit)
             if not messages:
                 stop.wait(min(args.poll_interval, max(0, deadline - time.monotonic())))
+    except RetryCancelled:
+        return
     except Exception as error:
         with state.lock:
             state.errors.append(f'{instance_name}: {type(error).__name__}: {error}')
@@ -248,7 +309,7 @@ def report(snapshot, elapsed, final=False):
           f"consumed {snapshot['consumed']:,} | committed {snapshot['committed']:,} | "
           f"{snapshot['consumed'] / max(elapsed, .000001):,.0f} msg/s average | "
           f"{snapshot['payload_bytes'] / max(elapsed, .000001) / 1048576:.2f} payload MiB/s | "
-          f"errors {len(snapshot['errors'])}", file=sys.stderr, flush=True)
+          f"retries {snapshot['retries']} | errors {len(snapshot['errors'])}", file=sys.stderr, flush=True)
 
 
 def kafka_worker(kafka, client, args, state, stop, deadline, instance_name, output_lock):
