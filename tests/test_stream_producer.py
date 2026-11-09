@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'runStreamProducer.sh'
+SCRIPT = Path(__file__).resolve().parents[1] / 'runStreamProducerDemo.sh'
 SOURCE = SCRIPT.read_text().split("<<'OCI_STREAM_PRODUCER_PY'\n", 1)[1].rsplit('\nOCI_STREAM_PRODUCER_PY', 1)[0]
 PRODUCER = {'__name__': 'stream_producer'}
 exec(compile(SOURCE, str(SCRIPT), 'exec'), PRODUCER)

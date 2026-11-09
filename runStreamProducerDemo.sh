@@ -74,12 +74,12 @@ MAX_BATCH_BYTES = 1_000_000
 KEY_BUDGET = 96
 LATENCY_BOUNDS = (.001, .002, .005, .01, .02, .05, .1, .2, .5, 1, 2, 5, 10, 30, 60, float('inf'))
 USAGE_EXAMPLES = """Examples:
-  ./runStreamProducer.sh <stream-name> --endpoint private
-  ./runStreamProducer.sh <stream-name> --endpoint public
-  ./runStreamProducer.sh <stream-name> --duration 60 --workers 4
-  ./runStreamProducer.sh <stream-name> --rate 2000 --max-messages 100000
-  ./runStreamProducer.sh <stream-name> --endpoint https://<messages-host> --dry-run
-  ./runStreamProducer.sh --endpoint private --dry-run  # stream name from .env
+  ./runStreamProducerDemo.sh <stream-name> --endpoint private
+  ./runStreamProducerDemo.sh <stream-name> --endpoint public
+  ./runStreamProducerDemo.sh <stream-name> --duration 60 --workers 4
+  ./runStreamProducerDemo.sh <stream-name> --rate 2000 --max-messages 100000
+  ./runStreamProducerDemo.sh <stream-name> --endpoint https://<messages-host> --dry-run
+  ./runStreamProducerDemo.sh --endpoint private --dry-run  # stream name from .env
 """
 
 
@@ -354,7 +354,7 @@ def resolve_stream(oci, admin, args):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog='runStreamProducer.sh', description=__doc__,
+    parser = argparse.ArgumentParser(prog='runStreamProducerDemo.sh', description=__doc__,
                                      epilog=USAGE_EXAMPLES,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('stream_name', nargs='?', default=os.getenv('OCI_STREAM_NAME') or None,

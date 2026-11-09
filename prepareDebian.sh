@@ -21,14 +21,23 @@ curl -fsSL \
 bash /tmp/install-oci-cli.sh --accept-all-defaults
 export PATH="$HOME/bin:$PATH"
 
-# Python Kafka client: wheels include librdkafka; no local Kafka broker is needed.
-python3 -c 'import sys; sys.exit("Python 3.10+ is required" if sys.version_info < (3, 10) else 0)'
-python3 -m venv "$OCIKIT_DIR/.venv"
-"$OCIKIT_DIR/.venv/bin/python" -m pip install --upgrade pip
-"$OCIKIT_DIR/.venv/bin/python" -m pip install 'oci>=2.189.0,<3' 'confluent-kafka>=2.12,<3'
+# Provision the stream runtime with uv (independent of the OCI CLI's Python).
+export PATH="$HOME/.local/bin:$PATH"
+if ! command -v uv >/dev/null 2>&1; then
+    OCIKIT_UV_INSTALLER=$(mktemp)
+    trap 'rm -f -- "$OCIKIT_UV_INSTALLER"' EXIT
+    curl -fsSL https://astral.sh/uv/install.sh -o "$OCIKIT_UV_INSTALLER"
+    UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh "$OCIKIT_UV_INSTALLER"
+    rm -f -- "$OCIKIT_UV_INSTALLER"
+    trap - EXIT
+fi
+uv python install 3.11
+uv venv --python 3.11 --managed-python --allow-existing "$OCIKIT_DIR/.venv"
+# Kafka wheels include librdkafka; no local Kafka broker is needed.
+uv pip install --python "$OCIKIT_DIR/.venv/bin/python" 'oci>=2.189.0,<3' 'confluent-kafka>=2.12,<3'
 
 cat <<'KAFKA_SETUP'
-Kafka client installed in .venv beside these scripts.
+Python 3.11 and Kafka client provisioned with uv in .venv beside these scripts.
 Configure these entries in the adjacent .env (quote shell-special characters):
   OCI_KAFKA_USERNAME='tenancyName/domain/username/streamPoolId'
   OCI_KAFKA_AUTH_TOKEN='your OCI user auth token, not your console password'
@@ -39,6 +48,6 @@ Bootstrap servers are discovered from the pool. Optional override:
   OCI_KAFKA_BOOTSTRAP_SERVERS='host:9092'
 Allow TLS traffic to the pool Kafka endpoint on port 9092 (private DNS/network
 access is required for private pools). No local broker or Java is required.
-Example: ./runStreamConsumer.sh STREAM --group-name kafka-group --endpoint private --kafka
+Example: ./runStreamConsumerDemo.sh STREAM --group-name kafka-group --endpoint private --kafka
 KAFKA_SETUP
 

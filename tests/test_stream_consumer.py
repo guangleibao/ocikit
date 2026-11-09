@@ -13,7 +13,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'runStreamConsumer.sh'
+SCRIPT = Path(__file__).resolve().parents[1] / 'runStreamConsumerDemo.sh'
 SOURCE = SCRIPT.read_text().split("<<'OCI_STREAM_CONSUMER_PY'\n", 1)[1].rsplit('\nOCI_STREAM_CONSUMER_PY', 1)[0]
 CONSUMER = {'__name__': 'stream_consumer'}
 exec(compile(SOURCE, str(SCRIPT), 'exec'), CONSUMER)

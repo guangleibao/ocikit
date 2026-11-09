@@ -91,15 +91,15 @@ from urllib.parse import urlsplit
 import uuid
 
 USAGE_EXAMPLES = """Examples:
-  ./runStreamConsumer.sh <stream-name> --group-name my-group --endpoint private
-  ./runStreamConsumer.sh <stream-name> --group-name my-group --endpoint public
-  ./runStreamConsumer.sh <stream-name> --group-name my-group --duration 60 --workers 2 --request-rate 2
-  ./runStreamConsumer.sh <stream-name> --group-name new-group --cursor-type LATEST
-  ./runStreamConsumer.sh <stream-name> --group-name new-group --cursor-type AT_TIME --time 2026-11-09T00:00:00Z
-  ./runStreamConsumer.sh <stream-name> --group-name my-group --max-messages 1000 --print-messages
-  ./runStreamConsumer.sh --group-name my-group --endpoint private --dry-run
-  ./runStreamConsumer.sh <stream-name> --group-name kafka-group --endpoint private --kafka
-  ./runStreamConsumer.sh <stream-name> --group-name kafka-group --kafka --dry-run
+  ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --endpoint private
+  ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --endpoint public
+  ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --duration 60 --workers 2 --request-rate 2
+  ./runStreamConsumerDemo.sh <stream-name> --group-name new-group --cursor-type LATEST
+  ./runStreamConsumerDemo.sh <stream-name> --group-name new-group --cursor-type AT_TIME --time 2026-11-09T00:00:00Z
+  ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --max-messages 1000 --print-messages
+  ./runStreamConsumerDemo.sh --group-name my-group --endpoint private --dry-run
+  ./runStreamConsumerDemo.sh <stream-name> --group-name kafka-group --endpoint private --kafka
+  ./runStreamConsumerDemo.sh <stream-name> --group-name kafka-group --kafka --dry-run
 """
 
 
@@ -411,7 +411,7 @@ def timestamp(value):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog='runStreamConsumer.sh', description=__doc__,
+    parser = argparse.ArgumentParser(prog='runStreamConsumerDemo.sh', description=__doc__,
         epilog=USAGE_EXAMPLES, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('stream_name', nargs='?', default=os.getenv('OCI_STREAM_NAME') or None,
                         help='exact stream name (default: OCI_STREAM_NAME in .env)')
