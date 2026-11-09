@@ -209,7 +209,7 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(config['sasl.mechanism'], 'PLAIN')
         self.assertEqual(config['sasl.password'], 'secret-token')
         self.assertEqual(config['group.id'], 'group')
-        self.assertEqual(config['auto.offset.reset'], 'earliest')
+        self.assertEqual(config['auto.offset.reset'], 'latest')
         self.assertFalse(config['enable.auto.commit'])
         self.assertFalse(config['enable.auto.offset.store'])
         self.assertEqual(config['heartbeat.interval.ms'], 10000)
@@ -423,6 +423,9 @@ class ConsumerTests(unittest.TestCase):
         self.assertIn('batch size: 1000', output)
         self.assertIn('Pacing: 2 application calls/sec shared by all workers, including commits', output)
         self.assertIn('Duration: unlimited (until Ctrl-C)', output)
+        self.assertIn('New group position: LATEST', output)
+        self.assertIn('New group position: TRIM_HORIZON', self.cli([
+            'events', '--group-name', 'group', '--dry-run', '--cursor-type', 'TRIM_HORIZON']))
 
     def test_explicit_duration_in_dry_run(self):
         output = self.cli(['events', '--group-name', 'group', '--dry-run', '--duration', '120'])

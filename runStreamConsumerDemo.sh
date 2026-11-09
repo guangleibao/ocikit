@@ -48,7 +48,7 @@ A private endpoint requires private network connectivity and DNS resolution.
 
 All workers join the same group with unique instance names. OCI assigns the
 partitions; workers exceeding the partition count may remain idle. New groups
-start at TRIM_HORIZON by default. Existing groups resume committed offsets;
+start at LATEST by default (new messages only). Existing groups resume committed offsets;
 --cursor-type and --time apply only when the group is first created.
 
 Each batch is processed (counted and printed by default) before an explicit offset
@@ -119,7 +119,7 @@ USAGE_EXAMPLES = """Examples:
   ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --endpoint private --api oci
   ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --endpoint public
   ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --duration 60 --workers 2 --request-rate 2
-  ./runStreamConsumerDemo.sh <stream-name> --group-name new-group --cursor-type LATEST
+  ./runStreamConsumerDemo.sh <stream-name> --group-name new-group --cursor-type TRIM_HORIZON
   ./runStreamConsumerDemo.sh <stream-name> --group-name new-group --cursor-type AT_TIME --time 2026-11-09T00:00:00Z
   ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --max-messages 1000 --print-messages
   ./runStreamConsumerDemo.sh --group-name my-group --endpoint private --dry-run
@@ -663,8 +663,8 @@ def main(argv=None):
     parser.add_argument('--rate', type=float, default=1000,
                         help='processed messages/sec across all workers (default: 1000; twice the producer default of 500, ratio 1:2; 0 = unlimited; independent of --request-rate)')
     parser.add_argument('--max-messages', type=positive_int, help='maximum messages consumed across all workers in this process')
-    parser.add_argument('--cursor-type', choices=('TRIM_HORIZON', 'LATEST', 'AT_TIME'), default='TRIM_HORIZON',
-                        help='starting position for a NEW group (default: TRIM_HORIZON)')
+    parser.add_argument('--cursor-type', choices=('TRIM_HORIZON', 'LATEST', 'AT_TIME'), default='LATEST',
+                        help='starting position for a NEW group (default: LATEST, new messages only)')
     parser.add_argument('--time', type=timestamp, help='starting timestamp with timezone; required for AT_TIME')
     parser.add_argument('--poll-interval', type=positive_float, default=1, help='seconds between empty reads (default: 1; maximum: 10)')
     parser.add_argument('--report-interval', type=positive_float, default=5)
