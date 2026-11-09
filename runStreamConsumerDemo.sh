@@ -87,6 +87,11 @@ reads and commits share this cap; Kafka consume calls and commits share it.
 Kafka background network requests are managed separately by the Kafka clients;
 fetch limits and backoff reduce bursts. Other processes share OCI's
 service limits, so these settings cannot guarantee that throttling never occurs.
+Default --rate is 1000 messages/second across all workers, twice the producer's
+default 500 messages/second (producer:consumer = 1:2). This is a message-processing
+cap, separate from --request-rate (API calls/second). Actual throughput can be
+lower due to available messages, API pacing, or latency. --rate 0 disables only
+message-rate pacing; the API-call cap still applies. Kafka may prefetch messages.
 """
 import argparse
 import base64
@@ -148,11 +153,28 @@ class RateLimiter:
                 stop.wait(delay)
 
 
+class MessagePacer:
+    """Globally pace actual batch counts; fetched batches drain promptly on stop."""
+    def __init__(self, rate):
+        self.lock = threading.Lock()
+        self.rate = rate
+        self.next_due = 0.0
+
+    def wait(self, count, stop, deadline):
+        if not self.rate or not count:
+            return
+        with self.lock:
+            self.next_due = max(time.monotonic(), self.next_due) + count / self.rate
+            due = min(self.next_due, deadline)
+        stop.wait(max(0, due - time.monotonic()))
+
+
 class State:
     """Reserve read capacity so concurrent workers honor the global message cap."""
-    def __init__(self, maximum, request_rate=2):
+    def __init__(self, maximum, request_rate=2, message_rate=1000):
         self.lock = threading.Lock()
         self.pacer = RateLimiter(request_rate)
+        self.message_pacer = MessagePacer(message_rate)
         self.maximum = maximum
         self.reserved = 0
         self.consumed = self.committed = self.payload_bytes = self.requests = 0
@@ -277,6 +299,7 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
                 next_cursor = require_cursor(response.headers.get('opc-next-cursor'))
                 payload_bytes = sum(len(base64.b64decode(message.value or '', validate=True))
                                     for message in messages)
+                state.message_pacer.wait(len(messages), stop, deadline)
                 if args.print_messages:
                     with output_lock:
                         for message in messages:
@@ -361,6 +384,7 @@ def kafka_worker(kafka, client, args, state, stop, deadline, instance_name, outp
                         value=base64.b64encode(value).decode('ascii') if value is not None else None))
                     partition = (record.topic(), record.partition())
                     offsets[partition] = max(offsets.get(partition, 0), record.offset() + 1)
+                state.message_pacer.wait(len(messages), stop, deadline)
                 if args.print_messages:
                     with output_lock:
                         for message in messages:
@@ -502,7 +526,7 @@ class JavaKafkaClient:
 def consume(oci, clients, args, run_id):
     stop = threading.Event()
     interrupted = threading.Event()
-    state = State(args.max_messages, args.request_rate)
+    state = State(args.max_messages, args.request_rate, args.rate)
     output_lock = threading.Lock()
     old_signals = {}
     def interrupt(signum, frame):
@@ -546,6 +570,7 @@ def consume(oci, clients, args, run_id):
                        group_name=args.group_name, instance_name_prefix=prefix,
                        workers=args.workers, batch_size=args.batch_size, elapsed_seconds=elapsed,
                        request_rate=args.request_rate,
+                       target_messages_per_second=args.rate,
                        protocol='kafka' if (args.api != 'oci') else 'rest', api=args.api,
                        interrupted=interrupted.is_set(), **snapshot)
         args.json_report.expanduser().write_text(json.dumps(summary, indent=2) + '\n')
@@ -635,6 +660,8 @@ def main(argv=None):
     parser.add_argument('--batch-size', type=positive_int, default=1000, help='maximum messages/read (default: 1000; maximum: 10000)')
     parser.add_argument('--request-rate', type=positive_float, default=2,
                         help='application calls/second across all workers, including commits (default: 2; Kafka background fetches are separate)')
+    parser.add_argument('--rate', type=float, default=1000,
+                        help='processed messages/sec across all workers (default: 1000; twice the producer default of 500, ratio 1:2; 0 = unlimited; independent of --request-rate)')
     parser.add_argument('--max-messages', type=positive_int, help='maximum messages consumed across all workers in this process')
     parser.add_argument('--cursor-type', choices=('TRIM_HORIZON', 'LATEST', 'AT_TIME'), default='TRIM_HORIZON',
                         help='starting position for a NEW group (default: TRIM_HORIZON)')
@@ -650,6 +677,8 @@ def main(argv=None):
     parser.add_argument('--dry-run', action='store_true', help='show plan without importing OCI, authenticating or consuming')
     args = parser.parse_args(argv)
     args.kafka_username = (args.kafka_username or '').strip() or None
+    if not math.isfinite(args.rate) or args.rate < 0:
+        parser.error('--rate must be finite and nonnegative')
     for value, setting in ((args.stream_name, 'OCI_STREAM_NAME or provide a stream name'),
                            (args.group_name, 'OCI_STREAM_GROUP_NAME or provide --group-name')):
         if not value or not value.strip():
@@ -663,6 +692,8 @@ def main(argv=None):
         parser.error('--workers must not exceed 128')
     if args.batch_size > 10000:
         parser.error('--batch-size must not exceed 10000')
+    if args.rate:
+        args.batch_size = min(args.batch_size, max(1, int(args.rate)))
     if args.poll_interval > 10:
         parser.error('--poll-interval must not exceed 10 to keep group membership active')
     if (args.cursor_type == 'AT_TIME') != (args.time is not None):
@@ -697,6 +728,7 @@ def main(argv=None):
         duration_plan = f'{args.duration:g}s' if args.duration is not None else 'unlimited (until Ctrl-C)'
         print(f'Duration: {duration_plan}; batch size: {args.batch_size}; maximum consumed: {args.max_messages or "unlimited"}')
         print(f'Pacing: {args.request_rate:g} application calls/sec shared by all workers, including commits')
+        print(f'Message rate: {args.rate:g} messages/sec across all workers (0=unlimited; producer default: 500, ratio 1:2)')
         if args.api == 'kafka-python':
             print('Kafka background fetches are separate; prefetch is limited with 1-second queue/error backoff')
         elif args.api == 'kafka-java':
@@ -751,6 +783,7 @@ def main(argv=None):
         run_id = uuid.uuid4().hex
         print(f'Pacing: {args.request_rate:g} application calls/sec across {args.workers} worker(s), including commits',
               file=sys.stderr, flush=True)
+        print(f'Message rate: {args.rate:g} messages/sec across all workers (0=unlimited)', file=sys.stderr, flush=True)
         try:
             for index in range(args.workers):
                 instance_name = f'{args.instance_name or run_id}-{index}'

@@ -429,7 +429,7 @@ class ConsumerTests(unittest.TestCase):
         self.assertIn('Duration: 120s', output)
 
     def test_continuous_run_has_no_deadline_and_drains_on_interrupt(self):
-        args = SimpleNamespace(max_messages=None, request_rate=2, duration=None, workers=1,
+        args = SimpleNamespace(max_messages=None, request_rate=2, rate=1000, duration=None, workers=1,
                                instance_name=None, api='oci', report_interval=5, json_report=None)
         previous_handler = signal.getsignal(signal.SIGINT)
         def idle_worker(oci, client, args, state, stop, deadline, instance_name, output_lock):
@@ -443,7 +443,7 @@ class ConsumerTests(unittest.TestCase):
         self.assertIs(signal.getsignal(signal.SIGINT), previous_handler)
 
     def test_explicit_duration_stops_empty_stream(self):
-        args = SimpleNamespace(max_messages=None, request_rate=10000, duration=.03, workers=1,
+        args = SimpleNamespace(max_messages=None, request_rate=10000, rate=1000, duration=.03, workers=1,
                                instance_name=None, api='oci', report_interval=5, json_report=None,
                                group_name='group', stream_id='stream', cursor_type='TRIM_HORIZON',
                                time=None, batch_size=1000, print_messages=False, poll_interval=.001)
@@ -456,6 +456,7 @@ class ConsumerTests(unittest.TestCase):
 
     def test_invalid_parameters(self):
         cases = [[], ['--batch-size', '10001'], ['--workers', '129'], ['--poll-interval', '11'],
+                 ['--rate', '-1'], ['--rate', 'nan'], ['--rate', 'inf'],
                  ['--duration', '0'], ['--duration', '-1'],
                  ['--request-rate', '0'], ['--request-rate', 'nan'], ['--request-rate', 'inf'],
                  ['--cursor-type', 'AT_TIME'], ['--time', '2026-11-09T00:00:00Z'],
@@ -472,9 +473,40 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 0)
         self.assertIn('Examples:', output.getvalue())
         self.assertIn('--endpoint private', output.getvalue())
+        self.assertIn('ratio 1:2', output.getvalue())
+
+    def test_message_rate_defaults_override_and_unlimited(self):
+        self.assertIn('Message rate: 1000 messages/sec', self.cli(['events', '--group-name', 'group', '--dry-run']))
+        output = self.cli(['events', '--group-name', 'group', '--rate', '50', '--dry-run'])
+        self.assertIn('Message rate: 50 messages/sec', output)
+        self.assertIn('batch size: 50', output)
+        output = self.cli(['events', '--group-name', 'group', '--rate', '0', '--dry-run'])
+        self.assertIn('Message rate: 0 messages/sec', output)
+        self.assertIn('Pacing: 2 application calls/sec', output)
 
 
 class PacingTests(unittest.TestCase):
+    def test_message_pacing_is_weighted_and_shared_between_batches(self):
+        clock = SimpleNamespace(monotonic=lambda: 0)
+        stop = Mock()
+        with patch.dict(CONSUMER, {'time': clock}):
+            pacer = CONSUMER['MessagePacer'](1000)
+            pacer.wait(500, stop, float('inf'))
+            pacer.wait(500, stop, float('inf'))
+        self.assertEqual([call.args[0] for call in stop.wait.call_args_list], [.5, 1])
+
+    def test_empty_batches_and_unlimited_message_rate_do_not_wait(self):
+        stop = Mock()
+        CONSUMER['MessagePacer'](1000).wait(0, stop, float('inf'))
+        CONSUMER['MessagePacer'](0).wait(1000, stop, float('inf'))
+        stop.wait.assert_not_called()
+
+    def test_message_pacing_respects_duration_for_fetched_batch_drain(self):
+        stop = Mock()
+        with patch.dict(CONSUMER, {'time': SimpleNamespace(monotonic=lambda: 0)}):
+            CONSUMER['MessagePacer'](1000).wait(1000, stop, .25)
+        stop.wait.assert_called_once_with(.25)
+
     def test_shared_limiter_spaces_concurrent_workers(self):
         limiter = CONSUMER['RateLimiter'](40)
         starts = []

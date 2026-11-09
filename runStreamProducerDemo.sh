@@ -59,6 +59,10 @@ resends are performed. Timeouts/5xx are uncertain delivery, not proven rejection
 By default, keep producing until Ctrl-C. An explicit --duration limits new
 requests; in-flight requests drain up to their timeouts. --max-messages also
 stops the run when the requested number of messages has been attempted.
+Default --rate is 500 messages/second across all workers, half the consumer's
+default 1000 messages/second (producer:consumer = 1:2). These are pacing targets;
+actual throughput depends on service latency and available messages. --rate 0
+disables message-rate pacing.
 Exit: 0 all acknowledged, 1 rejected/uncertain/fatal errors, 130 interrupted.
 """
 import argparse
@@ -377,7 +381,8 @@ def main(argv=None):
     parser.add_argument('--workers', type=positive_int, default=4, help='concurrent SDK clients (default: 4)')
     parser.add_argument('--batch-size', type=positive_int, default=100, help='maximum messages/request; shrinks to fit 1 MB (default: 100)')
     parser.add_argument('--message-size', type=positive_int, default=1024, help='decoded payload bytes/message (default: 1024)')
-    parser.add_argument('--rate', type=float, default=0, help='global attempted messages/sec; 0 = unlimited (default)')
+    parser.add_argument('--rate', type=float, default=500,
+                        help='attempted messages/sec across all workers (default: 500; half the consumer default of 1000, ratio 1:2; 0 = unlimited)')
     parser.add_argument('--max-messages', type=positive_int, help='maximum attempted messages across all workers')
     parser.add_argument('--key', help='fixed UTF-8 key to stress one partition (default: unique keys)')
     parser.add_argument('--report-interval', type=positive_float, default=5)

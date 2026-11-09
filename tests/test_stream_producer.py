@@ -75,6 +75,21 @@ class EndpointTests(unittest.TestCase):
         self.assertIn('Duration: unlimited (until Ctrl-C)', self.dry_run([]))
         self.assertIn('Duration: 120s', self.dry_run(['--duration', '120']))
 
+    def test_default_rate_is_half_consumer_default_and_can_be_overridden(self):
+        self.assertIn('Rate: 500 messages/sec', self.dry_run([]))
+        self.assertIn('Rate: 100 messages/sec', self.dry_run(['--rate', '100']))
+        self.assertIn('Rate: 0 messages/sec', self.dry_run(['--rate', '0']))
+        with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit) as error:
+            PRODUCER['main'](['--help'])
+        self.assertEqual(error.exception.code, 0)
+        self.assertIn('ratio 1:2', output.getvalue())
+
+    def test_message_rate_globally_paces_producer_allocations(self):
+        with patch.object(PRODUCER['time'], 'monotonic', return_value=0):
+            allocator = PRODUCER['Allocator'](float('inf'), 50, 500, None, 0)
+            self.assertAlmostEqual(allocator.claim()[2], .1)
+            self.assertAlmostEqual(allocator.claim()[2], .2)
+
     def test_continuous_run_can_be_interrupted(self):
         args = SimpleNamespace(duration=None, rate=0, max_messages=None, workers=1,
                                report_interval=5, json_report=None, stream_id='stream',
