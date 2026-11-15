@@ -1,8 +1,11 @@
 """Offline checks for the Python embedded in the standalone producer."""
 from contextlib import redirect_stderr, redirect_stdout
+import base64
 import io
+import json
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,12 +119,102 @@ class EndpointTests(unittest.TestCase):
         self.assertIn('discover private endpoint', self.dry_run([], env))
         self.assertIn('discover public endpoint', self.dry_run(['--endpoint', 'public'], env))
 
+    def test_otlp_plan_accounts_for_envelope_and_inner_base64(self):
+        self.assertIn('Format: raw bytes', self.dry_run([]))
+        output = self.dry_run(['--otlp', '--message-size', '100000', '--batch-size', '100', '--rate', '0'])
+        self.assertIn('Format: OTLP Logs JSON', output)
+        self.assertIn('effective batch size: 7', output)
+        # Raw payload fits; its OTLP representation exceeds the request budget.
+        self.dry_run(['--message-size', '800000'])
+        with self.assertRaises(SystemExit) as error:
+            self.dry_run(['--otlp', '--message-size', '800000'])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_worker_publishes_otlp_envelope_and_counts_full_value_bytes(self):
+        for otlp in (False, True):
+            with self.subTest(otlp=otlp):
+                args = SimpleNamespace(message_size=5, otlp=otlp, key=None,
+                                       stream_id='stream', error_backoff=0)
+                oci, client = Mock(), Mock()
+                oci.streaming.models.PutMessagesDetailsEntry.side_effect = lambda **kw: SimpleNamespace(**kw)
+                oci.streaming.models.PutMessagesDetails.side_effect = lambda **kw: SimpleNamespace(**kw)
+                client.put_messages.return_value.data.entries = [SimpleNamespace(error=None, partition='0')] * 2
+                allocator = PRODUCER['Allocator'](float('inf'), 2, 0, 2, time.monotonic())
+                metrics = PRODUCER['Metrics']()
+                with patch.object(PRODUCER['os'], 'urandom', return_value=b'\x00\xffabc'), \
+                     patch.object(PRODUCER['time'], 'time_ns', return_value=1758112881118549000):
+                    PRODUCER['worker'](oci, client, args, allocator, metrics, threading.Event(), 'run', 0)
+                messages = client.put_messages.call_args.args[1].messages
+                self.assertEqual(len(messages), 2)
+                value = base64.b64decode(messages[0].value, validate=True)
+                if otlp:
+                    resource = json.loads(value)['resourceLogs'][0]
+                    record = resource['scopeLogs'][0]['logRecords'][0]
+                    self.assertEqual(record['timeUnixNano'], '1758112881118549000')
+                    self.assertEqual(record['severityNumber'], 9)
+                    self.assertEqual(base64.b64decode(record['body']['bytesValue']), b'\x00\xffabc')
+                    bound = len(PRODUCER['otlp_payload']('', 2**64 - 1)) + 8
+                    self.assertLessEqual(len(value), bound)
+                else:
+                    self.assertEqual(value, b'\x00\xffabc')
+                self.assertNotEqual(messages[0].key, messages[1].key)
+                self.assertEqual(metrics.snapshot()['payload_bytes'], 2 * len(value))
+
     def test_url_override_and_invalid_directive(self):
         self.assertIn('Endpoint: https://messages.example.com\n',
                       self.dry_run(['--endpoint', 'https://messages.example.com/']))
         with self.assertRaises(SystemExit) as error:
             self.dry_run(['--endpoint', 'invalid'])
         self.assertEqual(error.exception.code, 2)
+
+    def test_motd_uses_system_text_or_generates_fallback(self):
+        with patch.object(PRODUCER['Path'], 'read_text', return_value='Welcome!\n'):
+            self.assertEqual(PRODUCER['motd_sample'](), ('Welcome!\n', '/etc/motd'))
+        for read_options in ({'return_value': ' \n'}, {'side_effect': FileNotFoundError()}):
+            with self.subTest(read_options=read_options), \
+                 patch.object(PRODUCER['Path'], 'read_text', **read_options):
+                text, source = PRODUCER['motd_sample']()
+                self.assertEqual(source, 'generated greeting')
+                self.assertIn('Message of the day', text)
+
+    def test_sample_implies_otlp_defaults_to_one_and_allows_repeat_count(self):
+        text = 'Welcome "visitor"!\n你好\n'
+        with patch.dict(PRODUCER, {'motd_sample': lambda: (text, '/etc/motd')}):
+            output = self.dry_run(['--otlp-sample', '--message-size', '9999999'])
+            self.assertIn('Format: OTLP Logs JSON', output)
+            self.assertIn('maximum attempted: 1\n', output)
+            self.assertIn('MOTD sample: /etc/motd; body.stringValue', output)
+            budget = len(PRODUCER['otlp_payload']('', 2**64 - 1, body_text=text))
+            self.assertIn(f'decoded value budget: <= {budget:,} bytes/message', output)
+            self.assertIn('maximum attempted: 3\n', self.dry_run(['--otlp-sample', '--max-messages', '3']))
+
+    def test_sample_size_limit_includes_json_escaping(self):
+        with patch.dict(PRODUCER, {'motd_sample': lambda: ('\n' * 600000, '/etc/motd')}), \
+             self.assertRaises(SystemExit) as error:
+            self.dry_run(['--otlp-sample'])
+        self.assertEqual(error.exception.code, 2)
+
+    def test_worker_pushes_motd_as_otlp_text_and_counts_serialized_bytes(self):
+        text = 'Message of the day: 你好!\nWelcome "visitor".\n'
+        args = SimpleNamespace(message_size=len(text.encode()), sample_text=text, otlp=True,
+                               key=None, stream_id='stream', error_backoff=0)
+        oci, client = Mock(), Mock()
+        oci.streaming.models.PutMessagesDetailsEntry.side_effect = lambda **kw: SimpleNamespace(**kw)
+        oci.streaming.models.PutMessagesDetails.side_effect = lambda **kw: SimpleNamespace(**kw)
+        client.put_messages.return_value.data.entries = [SimpleNamespace(error=None, partition='0')]
+        allocator = PRODUCER['Allocator'](float('inf'), 100, 0, 1, time.monotonic())
+        metrics = PRODUCER['Metrics']()
+        with patch.object(PRODUCER['os'], 'urandom') as random_bytes:
+            PRODUCER['worker'](oci, client, args, allocator, metrics, threading.Event(), 'run', 0)
+        random_bytes.assert_not_called()
+        client.put_messages.assert_called_once()
+        messages = client.put_messages.call_args.args[1].messages
+        self.assertEqual(len(messages), 1)
+        raw = base64.b64decode(messages[0].value, validate=True)
+        record = json.loads(raw)['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
+        self.assertEqual(record['body'], {'stringValue': text})
+        self.assertGreater(int(record['timeUnixNano']), 0)
+        self.assertEqual(metrics.snapshot()['payload_bytes'], len(raw))
 
 
 if __name__ == '__main__':

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class LauncherTests(unittest.TestCase):
     def test_selects_python_without_sourcing_activation(self):
-        for script in ('runStreamConsumerDemo.sh', 'runStreamProducerDemo.sh'):
+        for script in ('runStreamConsumerDemo.sh', 'runStreamProducerDemo.sh', 'getStreamConsumerDashboard.sh'):
             for selection in ('caller', 'adjacent', 'active'):
                 with self.subTest(script=script, selection=selection), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -32,7 +32,7 @@ class LauncherTests(unittest.TestCase):
                     if selection == 'active':
                         env['VIRTUAL_ENV'] = str(environment)
                     args = ['sh', str(deployment / script), 'events', '--dry-run']
-                    if 'Consumer' in script:
+                    if script == 'runStreamConsumerDemo.sh':
                         args.extend(['--group-name', 'offline-group'])
                     result = subprocess.run(args, cwd=caller, env=env, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)

@@ -52,7 +52,20 @@ A private endpoint requires a private network path and DNS resolution from this 
 it does not change the pool's network configuration. With no endpoint directive,
 the stream's configured messages endpoint is discovered automatically.
 
-Payloads contain random bytes, reused within a worker. Unique keys spread load
+Payloads contain random bytes, reused within a worker.
+With --otlp, each value is an OTLP Logs JSON envelope containing one log record;
+the random bytes are its base64-encoded body.bytesValue. --message-size controls
+the raw body size; the envelope and inner base64 expansion add to the value size.
+Timestamps are refreshed per batch. Transport remains OCI Streaming PutMessages;
+downstream consumers must decode OTLP JSON. This does not upload to Log Analytics.
+Format reference: https://docs.oracle.com/en-us/iaas/log-analytics/doc/upload-opentelemetry-logs.html
+
+--otlp-sample implies --otlp and replaces random bytes with a message of the day
+in body.stringValue. Read /etc/motd once; if missing or empty, generate a greeting.
+Send one message by default; --max-messages overrides this count. --message-size
+is ignored in sample mode. Existing duration, rate and endpoint options still apply.
+
+Unique keys spread load
 across partitions; --key deliberately puts the load on one partition. A batch
 stays below 1,000,000 decoded key+value bytes. No automatic publish retries or
 resends are performed. Timeouts/5xx are uncertain delivery, not proven rejection.
@@ -88,6 +101,8 @@ USAGE_EXAMPLES = """Examples:
   ./runStreamProducerDemo.sh <stream-name> --endpoint private
   ./runStreamProducerDemo.sh <stream-name> --endpoint public
   ./runStreamProducerDemo.sh <stream-name> --duration 60 --workers 4
+  ./runStreamProducerDemo.sh <stream-name> --otlp --duration 60
+  ./runStreamProducerDemo.sh <stream-name> --otlp-sample
   ./runStreamProducerDemo.sh <stream-name> --rate 2000 --max-messages 100000
   ./runStreamProducerDemo.sh <stream-name> --endpoint https://<messages-host> --dry-run
   ./runStreamProducerDemo.sh --endpoint private --dry-run  # stream name from .env
@@ -194,8 +209,42 @@ def analyze_result(data, count):
     return acknowledged, rejected, 0, throttled, errors, partitions
 
 
+def otlp_payload(body_base64, timestamp, *, body_text=None):
+    """Encode an ExportLogsServiceRequest; protobuf bytes fields use base64 JSON.
+
+    Oracle's OTLP JSON example uses resourceLogs/scopeLogs/logRecords. The body
+    uses AnyValue.bytesValue for binary data or stringValue for the MOTD sample.
+    """
+    return json.dumps({'resourceLogs': [{
+        'resource': {'attributes': [
+            {'key': 'service.name', 'value': {'stringValue': 'ocikit-stream-producer'}}]},
+        'scopeLogs': [{'scope': {'name': 'runStreamProducerDemo.sh'},
+                       'logRecords': [{'timeUnixNano': str(timestamp),
+                                       'severityNumber': 9, 'severityText': 'INFO',
+                                       'body': ({'stringValue': body_text} if body_text is not None
+                                                else {'bytesValue': body_base64})}]}]
+    }]}, separators=(',', ':')).encode('utf-8')
+
+
+def motd_sample():
+    """Use static system MOTD text without executing login/update scripts."""
+    try:
+        text = Path('/etc/motd').read_text(encoding='utf-8', errors='replace')
+    except FileNotFoundError:
+        text = ''
+    if text.strip():
+        return text, '/etc/motd'
+    today = time.strftime('%Y-%m-%d', time.gmtime())
+    return (f'Message of the day ({today} UTC): Hello from OCIKit! '
+            'This sample log was published to OCI Streaming using OTLP Logs JSON.', 'generated greeting')
+
+
 def worker(oci, client, args, allocator, metrics, stop, run_id, worker_id):
-    payload = base64.b64encode(os.urandom(args.message_size)).decode('ascii')
+    sample_text = getattr(args, 'sample_text', None)
+    body_base64 = (base64.b64encode(os.urandom(args.message_size)).decode('ascii')
+                   if sample_text is None else '')
+    payload = body_base64
+    payload_size = args.message_size
     while not stop.is_set():
         allocation = allocator.claim()
         if allocation is None:
@@ -205,6 +254,10 @@ def worker(oci, client, args, allocator, metrics, stop, run_id, worker_id):
             return
         if time.monotonic() >= allocator.deadline:
             return
+        if args.otlp:
+            value = otlp_payload(body_base64, time.time_ns(), body_text=sample_text)
+            payload_size = len(value)
+            payload = base64.b64encode(value).decode('ascii')
         messages = []
         for number in range(first, first + count):
             key = args.key.encode('utf-8') if args.key is not None else f'{run_id}:{worker_id}:{number}'.encode()
@@ -242,7 +295,7 @@ def worker(oci, client, args, allocator, metrics, stop, run_id, worker_id):
             fatal = f'{type(error).__name__}: {error}'
         latency = time.monotonic() - started
         metrics.record(count, acknowledged, rejected, uncertain, throttled, latency,
-                       args.message_size, errors, partitions, fatal)
+                       payload_size, errors, partitions, fatal)
         if fatal:
             stop.set()
         if rejected or uncertain:
@@ -312,6 +365,9 @@ def stress(oci, clients, args, batch_size, run_id):
                'workers': args.workers, 'message_size_bytes': args.message_size,
                'batch_size': batch_size, 'target_messages_per_second': args.rate,
                'interrupted': interrupted.is_set(), **snapshot}
+    summary['payload_format'] = 'otlp-json' if getattr(args, 'otlp', False) else 'raw'
+    if getattr(args, 'otlp_sample', False):
+        summary['sample_source'] = args.sample_source
     if args.json_report:
         args.json_report.expanduser().write_text(json.dumps(summary, indent=2) + '\n')
         print('JSON report: ' + str(args.json_report.expanduser()))
@@ -380,7 +436,13 @@ def main(argv=None):
                         help='seconds to start new requests (default: run continuously until Ctrl-C)')
     parser.add_argument('--workers', type=positive_int, default=4, help='concurrent SDK clients (default: 4)')
     parser.add_argument('--batch-size', type=positive_int, default=100, help='maximum messages/request; shrinks to fit 1 MB (default: 100)')
-    parser.add_argument('--message-size', type=positive_int, default=1024, help='decoded payload bytes/message (default: 1024)')
+    parser.add_argument('--message-size', type=positive_int, default=1024,
+                        help='random body bytes/message, before OTLP wrapping if enabled (default: 1024)')
+    parser.add_argument('--otlp', action='store_true',
+                        help='encapsulate each message as OTLP Logs JSON with a binary body; publish via Streaming')
+    parser.add_argument('--otlp-sample', action='store_true',
+                        help='send MOTD as an OTLP text log (implies --otlp; default: one message; '
+                             '/etc/motd or generated greeting; ignores --message-size)')
     parser.add_argument('--rate', type=float, default=500,
                         help='attempted messages/sec across all workers (default: 500; half the consumer default of 1000, ratio 1:2; 0 = unlimited)')
     parser.add_argument('--max-messages', type=positive_int, help='maximum attempted messages across all workers')
@@ -406,7 +468,24 @@ def main(argv=None):
     key_budget = KEY_BUDGET if args.key is None else len(args.key.encode('utf-8'))
     if args.key == '':
         parser.error('--key must not be empty')
-    per_message = key_budget + args.message_size
+    args.sample_text = None
+    if args.otlp_sample:
+        args.otlp = True
+        if args.max_messages is None:
+            args.max_messages = 1
+        try:
+            args.sample_text, args.sample_source = motd_sample()
+        except OSError as error:
+            parser.error(f'cannot read /etc/motd: {error}')
+        args.message_size = len(args.sample_text.encode('utf-8'))
+    # Bound JSON timestamp width using the maximum protobuf fixed64 value. This
+    # includes inner base64 expansion, but not the outer SDK base64 transport.
+    payload_budget = (len(otlp_payload('', 2**64 - 1)) + 4 * ((args.message_size + 2) // 3)
+                      if args.otlp else args.message_size)
+    if args.otlp_sample:
+        payload_budget = len(otlp_payload('', 2**64 - 1, body_text=args.sample_text))
+    per_message = key_budget + payload_budget
+    payload_format = 'OTLP Logs JSON' if args.otlp else 'raw bytes'
     if per_message > MAX_BATCH_BYTES:
         parser.error('message plus key exceeds the 1 MB decoded request budget')
     batch_size = min(args.batch_size, MAX_BATCH_BYTES // per_message)
@@ -426,6 +505,9 @@ def main(argv=None):
             endpoint_plan = f'discover {args.endpoint} endpoint using stream pool type and StreamAdminClient.get_stream'
         print(f'Endpoint: {endpoint_plan}')
         print(f'Duration: {duration_plan}; workers: {args.workers}; effective batch size: {batch_size}; payload: {args.message_size} bytes')
+        print(f'Format: {payload_format}; decoded value budget: <= {payload_budget:,} bytes/message')
+        if args.otlp_sample:
+            print(f'MOTD sample: {args.sample_source}; body.stringValue; {args.message_size} UTF-8 bytes')
         print(f'Rate: {args.rate:g} messages/sec (0=unlimited); maximum attempted: {args.max_messages or "unlimited"}')
         print(f'Decoded batch budget: <= {batch_size * per_message:,} bytes; keys: {"fixed/single partition" if args.key is not None else "unique/distributed"}')
         print('No SDK import, instance metadata requests, authentication, publication or report writes.')
@@ -460,6 +542,9 @@ def main(argv=None):
             raise RuntimeError('Stream has no messages endpoint; specify --endpoint.')
         print(f'Messages endpoint: {endpoint}\nWorkers: {args.workers}; batch: {batch_size}; payload: {args.message_size} bytes; '
               f'duration: {duration_plan}; rate: {args.rate:g} msg/s (0=unlimited)', flush=True)
+        print(f'Format: {payload_format}; decoded value budget: <= {payload_budget:,} bytes/message', flush=True)
+        if args.otlp_sample:
+            print(f'MOTD sample: {args.sample_source}; body.stringValue; {args.message_size} UTF-8 bytes', flush=True)
         clients = []
         try:
             for _ in range(args.workers):
