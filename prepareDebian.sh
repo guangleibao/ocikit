@@ -50,3 +50,40 @@ Prerequisite preparation complete:
 Configure deployment settings in the adjacent .env as needed.
 Ensure the required IAM permissions, network connectivity, and DNS are available.
 PREPARATION_SUMMARY
+
+# Docker Initialization
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+
+sudo install -m 0755 -d /etc/apt/keyrings
+
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg \
+  -o /etc/apt/keyrings/docker.asc
+
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+sudo apt-get update
+
+sudo apt-get install -y \
+  docker-ce \
+  docker-ce-cli \
+  containerd.io \
+  docker-buildx-plugin \
+  docker-compose-plugin
+
+sudo systemctl enable --now containerd.service docker.service
+sudo systemctl is-active docker
+
+sudo groupadd -f docker
+sudo usermod -aG docker "$(id -un)"
+
+newgrp docker
