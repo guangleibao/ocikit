@@ -21,6 +21,7 @@ assert args[args.index('-H') + 1] == 'Authorization: Bearer Oracle'
 assert args[args.index('--connect-timeout') + 1] == '3'
 assert args[args.index('--max-time') + 1] == '30'
 assert '--location' not in args and '-L' not in args
+assert not any(arg.startswith('--retry') for arg in args)
 assert args[args.index('--write-out') + 1] == '%{http_code}'
 url = args[-1]
 assert url.startswith('http://imds.invalid/opc/v2/'), url
@@ -42,7 +43,7 @@ sys.exit(entry.get('exit', 0))
 
 
 class MetadataTests(unittest.TestCase):
-    def run_collector(self, fixture=None, options=(), retries=0):
+    def run_collector(self, fixture=None, options=()):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             shutil.copy2(SCRIPT, root / SCRIPT.name)
@@ -51,18 +52,20 @@ class MetadataTests(unittest.TestCase):
             binary.mkdir()
             (binary / 'curl').write_text('#!' + sys.executable + '\n' + FAKE_CURL)
             (binary / 'curl').chmod(0o755)
-            (binary / 'sleep').write_text('#!/bin/sh\nexit 0\n')
+            (binary / 'sleep').write_text('#!/bin/sh\ntouch "$IMDS_SLEEP_LOG"\nexit 99\n')
             (binary / 'sleep').chmod(0o755)
             fixture_path, log = root / 'fixture.json', root / 'calls'
             fixture_path.write_text(json.dumps(fixture if fixture is not None else self.fixture()))
             temporary = root / 'temporary'
             temporary.mkdir()
             env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
-                       IMDS_FIXTURE=str(fixture_path), IMDS_LOG=str(log), TMPDIR=str(temporary))
-            result = subprocess.run(['bash', str(root / SCRIPT.name), '--retries', str(retries), *options],
+                       IMDS_FIXTURE=str(fixture_path), IMDS_LOG=str(log), TMPDIR=str(temporary),
+                       IMDS_SLEEP_LOG=str(root / 'slept'))
+            result = subprocess.run(['bash', str(root / SCRIPT.name), *options],
                                     cwd=root, env=env, capture_output=True, text=True, timeout=30)
             calls = log.read_text().splitlines() if log.exists() else []
             self.assertEqual(list(temporary.iterdir()), [], 'temporary metadata should be cleaned up')
+            self.assertFalse((root / 'slept').exists(), 'failed IMDS paths must not trigger sleeps')
         return result, calls
 
     def fixture(self):
@@ -127,18 +130,22 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['endpoints']['/host/']['state'], 'unavailable')
 
-    def test_retries_404_429_5xx_and_transport_errors(self):
-        for failure in ({'status': 404}, {'status': 429}, {'status': 503},
-                        {'status': '000', 'exit': 28, 'error': 'timeout'}):
+    def test_immediately_skips_http_and_transport_errors_without_retry(self):
+        for failure in ({'status': 404}, {'status': 429}, {'status': 503}, {'status': 403},
+                        {'status': '000', 'exit': 28, 'error': 'timeout'},
+                        {'status': '000', 'exit': 7, 'error': 'connection refused'}):
             with self.subTest(failure=failure):
                 fixture = self.fixture()
-                fixture['/host/'] = [failure, {'body': {'recovered': True}}]
-                result, calls = self.run_collector(fixture, retries=1)
-                self.assertEqual(result.returncode, 0, result.stderr)
+                fixture['/volumeAttachments/'] = [failure, {'body': {'recovered': True}}]
+                result, calls = self.run_collector(fixture)
+                self.assertEqual(result.returncode, 0 if failure['status'] == 404 else 1, result.stderr)
                 report = json.loads(result.stdout)
-                self.assertEqual(report['endpoints']['/host/']['attempts'], 2)
-                self.assertEqual(calls.count('/host/'), 2)
-                self.assertEqual(report['metadata']['/host/'], {'recovered': True})
+                self.assertEqual(report['endpoints']['/volumeAttachments/']['attempts'], 1)
+                self.assertEqual(calls.count('/volumeAttachments/'), 1)
+                self.assertNotIn('/volumeAttachments/', report['metadata'])
+                self.assertIn('/host/', report['metadata'])
+                self.assertNotIn('Retrying', result.stderr)
+                self.assertEqual(len(calls), 9)
 
     def test_transport_failure_preserves_partial_output_and_exit_status(self):
         fixture = self.fixture()
@@ -193,7 +200,7 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['metadata']['/host/extra'], {'extra': 42})
         for options in (['--endpoint', '../bad'], ['--endpoint', 'http://elsewhere'],
-                        ['--endpoint', 'host//bad'], ['--retries', '6'], ['--unknown'],
+                        ['--endpoint', 'host//bad'], ['--retries', '0'], ['--unknown'],
                         ['--instance-only', '--endpoint', 'host/']):
             with self.subTest(options=options):
                 result, calls = self.run_collector(options=options)
@@ -215,10 +222,9 @@ class MetadataTests(unittest.TestCase):
     def test_permanent_http_failure_is_not_retried(self):
         fixture = self.fixture()
         fixture['/host/'] = {'status': 403, 'body': 'forbidden'}
-        # Supply root/identity listings so their fixture 404s do not add retries.
         fixture['/'] = {'body': {}}
         fixture['/identity/'] = {'body': {}}
-        result, calls = self.run_collector(fixture, retries=3)
+        result, calls = self.run_collector(fixture)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(calls.count('/host/'), 1)
         self.assertEqual(json.loads(result.stdout)['endpoints']['/host/']['attempts'], 1)

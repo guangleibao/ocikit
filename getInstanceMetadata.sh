@@ -7,7 +7,7 @@ set -euo pipefail
 
 usage() {
     cat <<'HELP'
-Usage: ./getInstanceMetadata.sh [--instance-only] [--endpoint PATH] [--retries N]
+Usage: ./getInstanceMetadata.sh [--instance-only] [--endpoint PATH]
 
 Collect IMDSv2 metadata as one JSON document on stdout. Diagnostics use stderr.
 Probe /, /instance/, /vnics/, /volumeAttachments/, /host/, /identity/ and the
@@ -19,14 +19,14 @@ private-key material and any user_data returned by IMDS.
 
   --endpoint PATH   Also probe an IMDS-relative path; repeatable, e.g. host/foo
   --instance-only   Original output: only the /instance/ JSON object
-  --retries N       Retries after the first attempt, 0-5 (default: 3)
   -h, --help        Show help
 
 Use OCI_METADATA_BASE_URL in the adjacent .env to override the default
 http://169.254.169.254/opc/v2. No IMDSv1 fallback or redirects are used.
 Every request includes Authorization: Bearer Oracle and bypasses proxies.
-404, 429, 5xx and transport failures retry with exponential backoff; each attempt
-has a 3-second connect timeout and 30-second total timeout.
+Each path is requested once. On any HTTP or transport error, record the failure
+and immediately continue to the next path, without retries or backoff. Each
+request has a 3-second connect timeout and 30-second total timeout.
 
 Output: .metadata["/host/"] (and other successful paths), .endpoints (per-path
 HTTP status, attempts and failures), and .summary. Missing optional paths (404 or
@@ -36,14 +36,13 @@ HTTP status, attempts and failures), and .summary. Missing optional paths (404 o
 
 Examples:
   ./getInstanceMetadata.sh | jq '.metadata["/host/"]'
-  ./getInstanceMetadata.sh --endpoint host/some-key --retries 1
+  ./getInstanceMetadata.sh --endpoint host/some-key
   ./getInstanceMetadata.sh --instance-only | jq '.regionInfo'
 HELP
 }
 
 # Parse before loading .env or checking dependencies so --help works anywhere.
 instance_only=0
-retries=3
 extra_paths=()
 # Keep discovery inside this namespace: no URL references, traversal, query
 # strings, fragments, percent escapes or option-like segments. A final slash is OK.
@@ -67,12 +66,6 @@ while [ "$#" -gt 0 ]; do
                 exit 2
             fi
             extra_paths+=("$2"); shift 2 ;;
-        --retries)
-            if [ "$#" -lt 2 ] || [[ ! "$2" =~ ^[0-5]$ ]]; then
-                echo 'Error: --retries must be an integer from 0 to 5.' >&2
-                exit 2
-            fi
-            retries=$2; shift 2 ;;
         *) echo "Error: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -131,27 +124,16 @@ while [ "$index" -lt "${#paths[@]}" ]; do
     [ "$duplicate" -eq 0 ] || continue
     if [ "${#seen[@]}" -ge 256 ]; then truncated=true; break; fi
     seen+=("$path")
-    attempt=0
-    while :; do
-        attempt=$((attempt + 1))
-        curl_exit=0
-        : > "$work_dir/body"
-        : > "$work_dir/error"
-        # -q must be first: ignore .curlrc, which could add proxy/redirect flags.
-        http_status=$(curl -q --noproxy '*' --silent --show-error \
-            --connect-timeout 3 --max-time 30 \
-            -H 'Authorization: Bearer Oracle' \
-            --output "$work_dir/body" --write-out '%{http_code}' \
-            "$base_url/$path" 2> "$work_dir/error") || curl_exit=$?
-        retry=0
-        if [ "$curl_exit" -ne 0 ]; then retry=1; fi
-        case "$http_status" in 404|429|5[0-9][0-9]) retry=1 ;; esac
-        if [ "$retry" -eq 0 ] || [ "$attempt" -gt "$retries" ]; then break; fi
-        delay=$((1 << (attempt - 1)))
-        printf 'Retrying /%s: HTTP %s, curl exit %s; waiting %ss.\n' \
-            "$path" "${http_status:-000}" "$curl_exit" "$delay" >&2
-        sleep "$delay"
-    done
+    curl_exit=0
+    : > "$work_dir/body"
+    : > "$work_dir/error"
+    # -q must be first: ignore .curlrc, which could add retries or redirects.
+    # Make exactly one attempt, including for 404/429/5xx and network errors.
+    http_status=$(curl -q --noproxy '*' --silent --show-error \
+        --connect-timeout 3 --max-time 30 \
+        -H 'Authorization: Bearer Oracle' \
+        --output "$work_dir/body" --write-out '%{http_code}' \
+        "$base_url/$path" 2> "$work_dir/error") || curl_exit=$?
     state=error
     if [ "$curl_exit" -eq 0 ]; then
         case "$http_status" in
@@ -161,7 +143,7 @@ while [ "$index" -lt "${#paths[@]}" ]; do
     fi
     # Empty/non-JSON responses remain strings; false/null JSON values are valid.
     jq -cn --arg path "/$path" --arg status "$http_status" --arg state "$state" \
-        --argjson curl_exit "$curl_exit" --argjson attempts "$attempt" \
+        --argjson curl_exit "$curl_exit" --argjson attempts 1 \
         --rawfile raw "$work_dir/body" --rawfile error "$work_dir/error" '
         (try {value: ($raw | fromjson), encoding: "json"}
          catch {value: $raw, encoding: "text"}) as $body |
