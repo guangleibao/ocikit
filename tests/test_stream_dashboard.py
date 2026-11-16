@@ -1,6 +1,7 @@
-"""Offline checks for dashboard decoding, independent cursors and terminal input."""
+"""Offline checks for dashboard decoding, explicit consumer groups, commits and terminal input."""
 import base64
 from contextlib import redirect_stdout, redirect_stderr
+import gzip
 import io
 import json
 import os
@@ -48,10 +49,15 @@ class DashboardTests(unittest.TestCase):
         source = producer.split("<<'OCI_STREAM_PRODUCER_PY'\n", 1)[1].rsplit('\nOCI_STREAM_PRODUCER_PY', 1)[0]
         namespace = {'__name__': 'producer'}
         exec(compile(source, 'producer', 'exec'), namespace)
-        payload = namespace['otlp_payload'](encoded(b'\x00\xffabc'), 123)
+        payload = namespace['otlp_payload'](b'\x00\xffabc', 123)
         size, count, lines = MODULE['decode_value'](encoded(payload), True)
         self.assertEqual((size, count), (len(payload), 1))
         self.assertIn('bytes[5] 00ff616263', lines[0])
+        text = 'Message of the day: Welcome to OCIKit! 你好\nEnjoy your day.'
+        sample = namespace['otlp_payload'](b'', 123, body_text=text)
+        _, count, lines = MODULE['decode_value'](encoded(sample), True)
+        self.assertEqual(count, 1)
+        self.assertIn('Message of the day: Welcome to OCIKit! 你好 Enjoy your day.', lines[0])
 
     def test_bad_otlp_is_counted_and_does_not_stop_following_messages(self):
         state = MODULE['State']()
@@ -63,6 +69,15 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(state.payload_bytes, sum(len(base64.b64decode(m.value)) for m in messages))
         self.assertIn('DECODE ERROR', state.recent[0])
 
+    def test_corrupt_gzip_and_invalid_protobuf_are_decode_errors(self):
+        state = MODULE['State']()
+        for raw in (b'\x1f\x8btruncated', gzip.compress(b'\xff')):
+            MODULE['capture_messages'](state,
+                [SimpleNamespace(partition='0', offset=1, value=encoded(raw))], True)
+        self.assertEqual(state.messages, 2)
+        self.assertEqual(state.decode_errors, 2)
+        self.assertTrue(all('DECODE ERROR' in line for line in state.recent))
+
     def test_recent_messages_and_preview_lengths_are_bounded(self):
         state = MODULE['State']()
         message = SimpleNamespace(partition='0', offset=1, value=encoded(b'a' * 1000))
@@ -71,90 +86,142 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(len(state.recent), 100)
         self.assertLess(len(state.recent[0]), 200)
 
-    def test_partition_cursor_never_joins_group_or_commits(self):
+    def args(self, **overrides):
+        settings = dict(stream_name='events', group_name='orders', instance_name='dashboard-test',
+            compartment_id='c', endpoint=None, cursor_type='LATEST', batch_size=100, otlp=False)
+        settings.update(overrides)
+        return SimpleNamespace(**settings)
+
+    def test_group_cursor_uses_exact_supplied_group_and_disables_auto_commit(self):
         oci, client, requests = Mock(), Mock(), Mock()
-        oci.exceptions.ServiceError = ServiceError
-        requests.call.side_effect = [SimpleNamespace(data=SimpleNamespace(value='initial')),
-            SimpleNamespace(data=[SimpleNamespace(partition='0', offset=42, value=encoded(b'hi'))],
-                            headers={'opc-next-cursor': 'next'})]
-        cursors, offsets, state = {}, {}, MODULE['State']()
-        args = SimpleNamespace(cursor_type='LATEST', batch_size=100, otlp=False)
-        for _ in range(2):
-            MODULE['poll_partition'](oci, client, requests, SimpleNamespace(id='stream'), '0',
-                                     cursors, offsets, args, state)
-        oci.streaming.models.CreateCursorDetails.assert_called_once_with(partition='0', type='LATEST')
-        self.assertIs(requests.call.call_args_list[1].args[0], client.get_messages)
-        self.assertEqual(requests.call.call_args_list[1].args[2], 'initial')
-        self.assertEqual((cursors, offsets), ({'0': 'next'}, {'0': 42}))
-        client.create_group_cursor.assert_not_called()
-        client.consumer_commit.assert_not_called()
+        requests.call.return_value.data.value = 'group-cursor'
+        cursor = MODULE['create_group_cursor'](oci, client, requests, SimpleNamespace(id='stream'), self.args())
+        self.assertEqual(cursor, 'group-cursor')
+        oci.streaming.models.CreateGroupCursorDetails.assert_called_once_with(
+            group_name='orders', instance_name='dashboard-test', type='LATEST', commit_on_get=False)
+        self.assertIs(requests.call.call_args.args[0], client.create_group_cursor)
+        client.create_cursor.assert_not_called()
+
+    def test_group_batch_is_captured_before_commit_and_uses_commit_response_cursor(self):
+        client, requests, state = Mock(), Mock(), MODULE['State']()
+        message = SimpleNamespace(partition='0', offset=42, value=encoded(b'hello'))
+        def call(method, stream_id, cursor, **kwargs):
+            if method is client.get_messages:
+                self.assertEqual(cursor, 'group-cursor')
+                return SimpleNamespace(data=[message], headers={'opc-next-cursor': 'next'})
+            self.assertIs(method, client.consumer_commit)
+            self.assertEqual(cursor, 'next')
+            self.assertEqual(state.messages, 1)
+            self.assertIn('hello', state.recent[0])
+            return SimpleNamespace(data=SimpleNamespace(value='committed-cursor'))
+        requests.call.side_effect = call
+        cursor = MODULE['consume_batch'](client, requests, SimpleNamespace(id='stream'),
+                                          'group-cursor', self.args(), state)
+        self.assertEqual(cursor, 'committed-cursor')
+        self.assertEqual(state.committed, 1)
+
+    def test_empty_batch_advances_cursor_without_commit(self):
+        client, requests, state = Mock(), Mock(), MODULE['State']()
+        requests.call.return_value = SimpleNamespace(data=[], headers={'opc-next-cursor': 'next'})
+        self.assertEqual(MODULE['consume_batch'](client, requests, SimpleNamespace(id='s'),
+            'initial', self.args(), state), 'next')
+        self.assertEqual(requests.call.call_count, 1)
+        self.assertEqual(state.committed, 0)
+
+    def test_failed_commit_keeps_messages_visible_without_counting_them_as_committed(self):
+        client, requests, state = Mock(), Mock(), MODULE['State']()
+        requests.call.side_effect = [SimpleNamespace(data=[SimpleNamespace(partition='0', offset=1,
+            value=encoded(b'hello'))], headers={'opc-next-cursor': 'next'}), ConnectionError('commit failed')]
+        with self.assertRaises(ConnectionError):
+            MODULE['consume_batch'](client, requests, SimpleNamespace(id='s'), 'initial', self.args(), state)
         self.assertEqual(state.messages, 1)
+        self.assertEqual(state.committed, 0)
+        self.assertIn('hello', state.recent[0])
 
-    def test_expired_cursor_resumes_after_last_observed_offset(self):
-        oci, client, requests = Mock(), Mock(), Mock()
-        oci.exceptions.ServiceError = ServiceError
-        cursors, offsets = {'0': 'expired'}, {'0': 42}
-        args = SimpleNamespace(cursor_type='LATEST', batch_size=100, otlp=False)
-        parameters = (oci, client, requests, SimpleNamespace(id='stream'), '0',
-                      cursors, offsets, args, MODULE['State']())
-        requests.call.side_effect = ServiceError(400)
-        with self.assertRaises(ServiceError):
-            MODULE['poll_partition'](*parameters)
-        self.assertEqual(cursors, {})
-        requests.call.side_effect = None
-        requests.call.return_value.data.value = 'resumed'
-        MODULE['poll_partition'](*parameters)
-        oci.streaming.models.CreateCursorDetails.assert_called_with(partition='0', type='AFTER_OFFSET', offset=42)
-
-    def test_missing_next_cursor_does_not_advance_or_count(self):
-        oci, client, requests = Mock(), Mock(), Mock()
-        oci.exceptions.ServiceError = ServiceError
+    def test_missing_next_cursor_does_not_advance_or_commit(self):
+        client, requests, state = Mock(), Mock(), MODULE['State']()
         requests.call.return_value = SimpleNamespace(data=[], headers={})
-        cursors, state = {'0': 'initial'}, MODULE['State']()
         with self.assertRaisesRegex(RuntimeError, 'no usable cursor'):
-            MODULE['poll_partition'](oci, client, requests, SimpleNamespace(id='s'), '0', cursors, {},
-                                     SimpleNamespace(batch_size=100), state)
-        self.assertEqual(cursors, {'0': 'initial'})
+            MODULE['consume_batch'](client, requests, SimpleNamespace(id='s'), 'initial', self.args(), state)
+        self.assertEqual(requests.call.call_count, 1)
         self.assertEqual(state.messages, 0)
 
-    def test_render_contains_group_offsets_and_sanitized_errors(self):
+    def test_render_shows_only_named_group_and_latest_message_first(self):
         state = MODULE['State']()
-        state.groups['cp1'] = ('found', [{'partition': '0', 'committed_offset': 42,
-                                         'reserved_instance': 'worker\x1b'}], None)
-        args = SimpleNamespace(stream_name='events', cursor_type='LATEST', otlp=True)
-        text = '\n'.join(MODULE['dashboard_lines'](state, args))
-        self.assertIn('cp9', text)
+        state.reservations = [{'partition': '0', 'committed_offset': 42, 'reserved_instance': 'worker\x1b'}]
+        state.recent.extend(['old-message', 'new-message'])
+        text = '\n'.join(MODULE['dashboard_lines'](state, self.args()))
+        self.assertIn('Group: orders', text)
+        self.assertNotIn('cp1', text)
+        self.assertNotIn('cp9', text)
         self.assertIn('42', text)
         self.assertIn('worker', text)
         self.assertNotIn('\x1b', text)
+        self.assertLess(text.index('new-message'), text.index('old-message'))
+
+    def test_long_latest_message_wraps_at_terminal_width(self):
+        state = MODULE['State']()
+        state.recent.append('Message of the day: ' + 'hello ' * 40)
+        lines = MODULE['dashboard_lines'](state, self.args(), width=40)
+        preview = lines[lines.index('LATEST CONSUMED MESSAGES (newest first; last 100 records retained)') + 1:]
+        self.assertGreater(len(preview), 1)
+        self.assertTrue(all(len(line) <= 39 for line in preview))
 
     def test_q_quits_and_sets_stop_while_monitor_is_busy(self):
         screen, stop = Mock(), threading.Event()
         screen.getmaxyx.return_value = (24, 100)
         screen.getch.side_effect = [MODULE['curses'].KEY_NPAGE, ord('q')]
-        args = SimpleNamespace(stream_name='events', cursor_type='LATEST', otlp=False)
+        args = self.args()
         with patch.dict(MODULE, {'monitor': lambda *unused: stop.wait(2)}), \
              patch.object(MODULE['curses'], 'curs_set'), \
              patch.object(MODULE['curses'], 'has_colors', return_value=False):
             self.assertEqual(MODULE['run_screen'](screen, args, MODULE['State'](), stop), 0)
         self.assertTrue(stop.is_set())
 
+    def test_auto_refresh_displays_new_message_without_scrolling(self):
+        screen, stop, state = Mock(), threading.Event(), MODULE['State']()
+        screen.getmaxyx.return_value = (24, 100)
+        state.recent.extend(f'old-message-{i}' for i in range(100))
+        def keypress():
+            if screen.getch.call_count == 1:
+                state.recent.append('LATEST MOTD: Welcome to OCIKit')
+                screen.addnstr.reset_mock()
+                return -1
+            return ord('q')
+        screen.getch.side_effect = keypress
+        with patch.dict(MODULE, {'monitor': lambda *unused: stop.wait(2)}), \
+             patch.object(MODULE['curses'], 'curs_set'), \
+             patch.object(MODULE['curses'], 'has_colors', return_value=False):
+            MODULE['run_screen'](screen, self.args(), state, stop)
+        rendered = [call.args[2] for call in screen.addnstr.call_args_list]
+        self.assertIn('LATEST MOTD: Welcome to OCIKit', rendered)
+        self.assertLess(rendered.index('LATEST MOTD: Welcome to OCIKit'), rendered.index('old-message-99'))
+        screen.timeout.assert_called_once_with(100)
+
     def test_dry_run_without_sdk_and_endpoint_override(self):
         for options in ([], ['--otlp', '--endpoint', 'public']):
             output = io.StringIO()
             with patch.dict(os.environ, {'OCI_COMPARTMENT_ID': 'c', 'OCI_STREAM_ENDPOINT': 'private'}, clear=True), \
                  patch.dict('sys.modules', {'oci': None}), redirect_stdout(output):
-                self.assertEqual(MODULE['main'](['events', '--dry-run', *options]), 0)
-            self.assertIn('cp1-cp9', output.getvalue())
-            self.assertIn('OTLP Logs JSON' if options else 'raw', output.getvalue())
+                self.assertEqual(MODULE['main'](['events', '--group-name', 'orders', '--dry-run', *options]), 0)
+            self.assertIn('Group: orders', output.getvalue())
+            self.assertNotIn('cp1-cp9', output.getvalue())
+            self.assertIn('OTLP Logs Protobuf + gzip' if options else 'raw', output.getvalue())
             self.assertIn('endpoint=public' if options else 'endpoint=private', output.getvalue())
 
     def test_invalid_batch_size_is_rejected(self):
         with patch.dict(os.environ, {'OCI_COMPARTMENT_ID': 'c'}), redirect_stderr(io.StringIO()), \
              self.assertRaises(SystemExit):
-            MODULE['main'](['events', '--dry-run', '--batch-size', '0'])
+            MODULE['main'](['events', '--group-name', 'orders', '--dry-run', '--batch-size', '0'])
 
-    def test_monitor_probes_cp1_through_cp9_and_closes_clients(self):
+    def test_group_name_is_required_even_if_environment_contains_one(self):
+        for options in ([], ['--group-name', '   ']):
+            with patch.dict(os.environ, {'OCI_COMPARTMENT_ID': 'c', 'OCI_STREAM_GROUP_NAME': 'cp1'}), \
+                 redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                MODULE['main'](['events', '--dry-run', *options])
+            self.assertEqual(error.exception.code, 2)
+
+    def run_monitor(self, expired=False):
         oci, stop, state = Mock(), threading.Event(), MODULE['State']()
         oci.exceptions.ServiceError = ServiceError
         oci.exceptions.RequestException = ConnectionError
@@ -166,31 +233,42 @@ class DashboardTests(unittest.TestCase):
             messages_endpoint='https://messages.example.com', lifecycle_state='ACTIVE')
         admin.list_streams.return_value = SimpleNamespace(data=[stream], headers={})
         admin.get_stream.return_value.data = stream
-        client.create_cursor.return_value.data.value = 'cursor'
-        client.get_messages.return_value = SimpleNamespace(data=[], headers={'opc-next-cursor': 'next'})
-        def group(stream_id, name, **kwargs):
-            if name == 'cp9':
-                stop.set()
-            if name == 'cp2':
-                raise ServiceError(404)
-            return SimpleNamespace(data={'reservations': []})
-        client.get_group.side_effect = group
+        client.create_group_cursor.return_value.data.value = 'group-cursor'
+        client.consumer_commit.return_value.data.value = 'committed-cursor'
+        client.get_group.return_value.data = {'reservations': []}
+        def messages(*args, **kwargs):
+            if expired and client.get_messages.call_count == 1:
+                raise ServiceError(400)
+            return SimpleNamespace(data=[SimpleNamespace(partition='0', offset=42, value=encoded(b'hello'))],
+                                   headers={'opc-next-cursor': 'next'})
+        client.get_messages.side_effect = messages
         class ImmediateRequests:
             def __init__(self, *unused):
                 pass
             def call(self, method, *args, **kwargs):
-                return method(*args, **kwargs)
+                response = method(*args, **kwargs)
+                if method is client.consumer_commit:
+                    stop.set()
+                return response
         with patch.dict('sys.modules', {'oci': oci}), patch.dict(MODULE, {'Requests': ImmediateRequests}):
-            MODULE['monitor'](SimpleNamespace(stream_name='events', compartment_id='c', endpoint=None,
-                cursor_type='LATEST', batch_size=100, otlp=False), state, stop)
+            MODULE['monitor'](self.args(), state, stop)
         self.assertFalse(state.fatal, state.status)
-        self.assertEqual([c.args[1] for c in client.get_group.call_args_list], [f'cp{i}' for i in range(1, 10)])
-        self.assertEqual(state.groups['cp2'][0], 'absent/inaccessible')
-        self.assertEqual(oci.streaming.models.CreateCursorDetails.call_count, 2)
-        client.create_group_cursor.assert_not_called()
-        client.consumer_commit.assert_not_called()
+        client.get_group.assert_called_once_with('stream', 'orders')
+        client.create_cursor.assert_not_called()
+        self.assertEqual(state.messages, 1)
+        self.assertEqual(state.committed, 1)
+        self.assertEqual(client.create_group_cursor.call_count, 2 if expired else 1)
+        self.assertEqual(oci.streaming.models.CreateGroupCursorDetails.call_count, 2 if expired else 1)
+        for call in oci.streaming.models.CreateGroupCursorDetails.call_args_list:
+            self.assertEqual(call.kwargs['group_name'], 'orders')
         admin.base_client.session.close.assert_called_once()
         client.base_client.session.close.assert_called_once()
+
+    def test_monitor_consumes_only_the_specified_group_and_closes_clients(self):
+        self.run_monitor()
+
+    def test_expired_cursor_rejoins_only_the_specified_group(self):
+        self.run_monitor(expired=True)
 
 
 if __name__ == '__main__':

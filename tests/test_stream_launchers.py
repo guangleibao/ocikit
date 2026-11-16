@@ -32,7 +32,7 @@ class LauncherTests(unittest.TestCase):
                     if selection == 'active':
                         env['VIRTUAL_ENV'] = str(environment)
                     args = ['sh', str(deployment / script), 'events', '--dry-run']
-                    if script == 'runStreamConsumerDemo.sh':
+                    if script in ('runStreamConsumerDemo.sh', 'getStreamConsumerDashboard.sh'):
                         args.extend(['--group-name', 'offline-group'])
                     result = subprocess.run(args, cwd=caller, env=env, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)

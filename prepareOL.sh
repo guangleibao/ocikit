@@ -32,7 +32,7 @@ fi
 uv python install 3.11
 uv venv --python 3.11 --managed-python --allow-existing "$OCIKIT_DIR/.venv"
 # Kafka wheels include librdkafka; no local Kafka broker is needed.
-uv pip install --python "$OCIKIT_DIR/.venv/bin/python" 'oci>=2.189.0,<3' 'confluent-kafka>=2.12,<3'
+uv pip install --python "$OCIKIT_DIR/.venv/bin/python" 'oci>=2.189.0,<3' 'confluent-kafka>=2.12,<3' 'opentelemetry-proto>=1.28,<2'
 
 # Rebuild the native Java Kafka consumer on every preparation run.
 sudo dnf install -y java-17-openjdk-devel maven

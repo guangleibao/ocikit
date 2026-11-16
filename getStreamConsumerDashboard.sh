@@ -36,45 +36,55 @@ fi
 exec "$@" <<'OCI_STREAM_DASHBOARD_PY'
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["oci>=2.189.0,<3"]
+# dependencies = ["oci>=2.189.0,<3", "opentelemetry-proto>=1.28,<2"]
 # ///
 """Live OCI stream consumer dashboard. Press q to quit; arrows/PgUp/PgDn scroll.
 
-Usage: ./getStreamConsumerDashboard.sh STREAM_NAME [--endpoint private|public] [--otlp]
+Usage: ./getStreamConsumerDashboard.sh STREAM_NAME --group-name GROUP [--otlp]
 
-Like getStreamConsumerGroups.sh, inspect cp1 through cp9 using instance principals
-and .env beside the script (OCI_COMPARTMENT_ID, OCI_REGION, OCI_STREAM_ENDPOINT).
-Requires read streams, use stream-pull, and read stream-pools for endpoint filtering.
-A private endpoint requires private network access and DNS.
+Use instance principals and .env beside the script (OCI_COMPARTMENT_ID,
+OCI_REGION, OCI_STREAM_ENDPOINT). Requires read streams, use stream-pull, and
+read stream-pools for endpoint filtering. A private endpoint needs private DNS
+and network access. Specify the exact consumer group with --group-name; no
+names are guessed or probed. Each run joins with a unique consumer instance.
 
-Preview messages with independent partition cursors, starting at LATEST by default.
-No consumer groups are created/joined; group offsets and reservations are unchanged.
---cursor-type TRIM_HORIZON previews retained history instead. Preview counts/rates
-belong to this dashboard, not the monitored groups. Offsets are shown as returned
-by OCI; they are not a calculated backlog. Groups and partitions are polled round
-robin at two API calls/second combined; refresh slows as partition count grows.
-404 groups are absent OR inaccessible. Transient failures retry with backoff.
+Create a group cursor with commit_on_get=False. New groups start at LATEST by
+default; --cursor-type TRIM_HORIZON starts a new group at retained history.
+Existing groups resume committed offsets. Joining an existing group participates
+in its partition assignments alongside its other consumers. After decoding and
+retaining each batch for display, explicitly commit its returned cursor. Decode
+errors are displayed and counted as handled messages. Delivery is at least once:
+quitting or a failure before commit can cause a batch to be delivered again.
 
---otlp decodes OTLP Logs JSON envelopes (resourceLogs/scopeLogs/logRecords),
+Poll only the named group's state, and consume through its group cursor at two
+API calls/second total, including commits. Counts/rates describe this process;
+reservation offsets describe the group. Latest messages appear first and wrap
+to the terminal width. The screen refreshes automatically every 100 ms.
+
+--otlp decodes gzip-compressed OTLP Logs binary Protobuf requests (or legacy JSON),
 including the producer's body.bytesValue and text body.stringValue. This is OCI
 Streaming transport, not an OTLP HTTP/gRPC receiver. Malformed messages are counted
 and displayed without stopping the dashboard. Binary bodies show a hex preview.
 An interactive terminal and Python curses support are required, except for --dry-run.
 
 References:
-https://docs.oracle.com/en-us/iaas/Content/Streaming/Tasks/using_a_single_consumer.htm
-https://docs.oracle.com/en-us/iaas/log-analytics/doc/upload-opentelemetry-logs.html
+https://docs.oracle.com/en-us/iaas/Content/Streaming/Tasks/using_consumer_groups.htm
+https://opentelemetry.io/docs/specs/otlp/
 """
 import argparse
 import base64
 from collections import deque
 import curses
+import gzip
+import io
 import json
 import os
 import signal
 import sys
 import threading
+import textwrap
 import time
+import uuid
 from urllib.parse import urlsplit
 
 
@@ -86,7 +96,10 @@ class State:
     def __init__(self):
         self.lock = threading.Lock()
         self.status = 'Authenticating and resolving stream...'
-        self.groups = {f'cp{i}': ('waiting', [], None) for i in range(1, 10)}
+        self.group_status = 'waiting'
+        self.reservations = []
+        self.group_updated = None
+        self.committed = 0
         self.recent = deque(maxlen=100)
         self.messages = self.payload_bytes = self.records = self.decode_errors = 0
         self.retries = 0
@@ -163,7 +176,7 @@ def body_preview(body):
         value = base64.b64decode(body['bytesValue'], validate=True)
         return f'bytes[{len(value)}] {value[:32].hex()}'
     if 'stringValue' in body:
-        return safe_text(body['stringValue'])[:160]
+        return safe_text(body['stringValue'])[:2048]
     return safe_text(json.dumps(body, ensure_ascii=True))[:160]
 
 
@@ -176,7 +189,21 @@ def decode_value(value, otlp):
         except UnicodeDecodeError:
             preview = f'bytes[{len(raw)}] {raw[:32].hex()}'
         return len(raw), 0, [preview]
-    document = json.loads(raw)
+    if raw.startswith(b'\x1f\x8b'):
+        from google.protobuf.json_format import MessageToDict
+        from google.protobuf.message import DecodeError
+        from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
+                wire = compressed.read(16 * 1024 * 1024 + 1)
+            if len(wire) > 16 * 1024 * 1024:
+                raise ValueError('decompressed OTLP request exceeds 16 MiB preview limit')
+            request = ExportLogsServiceRequest.FromString(wire)
+            document = MessageToDict(request)
+        except (OSError, EOFError, DecodeError) as error:
+            raise ValueError(f'invalid gzip/Protobuf OTLP request: {error}') from error
+    else:
+        document = json.loads(raw)  # Retain support for previously published JSON.
     if not isinstance(document, dict) or not isinstance(document.get('resourceLogs'), list):
         raise ValueError('expected OTLP resourceLogs array')
     count, previews = 0, deque(maxlen=10)
@@ -218,26 +245,42 @@ def require_cursor(value):
     return value
 
 
-def poll_partition(oci, client, requests, stream, partition, cursors, offsets, args, state):
-    if partition not in cursors:
-        details = dict(partition=partition, type=args.cursor_type)
-        if partition in offsets:
-            details.update(type='AFTER_OFFSET', offset=offsets[partition])
-        cursors[partition] = require_cursor(requests.call(client.create_cursor, stream.id,
-            oci.streaming.models.CreateCursorDetails(**details)).data.value)
-        return
-    try:
-        response = requests.call(client.get_messages, stream.id, cursors[partition], limit=args.batch_size)
-    except oci.exceptions.ServiceError as error:
-        # Expired/invalid cursor: resume after the last observed offset when possible.
-        if error.status == 400:
-            cursors.pop(partition, None)
-        raise
+def create_group_cursor(oci, client, requests, stream, args):
+    details = oci.streaming.models.CreateGroupCursorDetails(
+        group_name=args.group_name, instance_name=args.instance_name,
+        type=args.cursor_type, commit_on_get=False)
+    return require_cursor(requests.call(client.create_group_cursor, stream.id, details).data.value)
+
+
+def consume_batch(client, requests, stream, cursor, args, state):
+    response = requests.call(client.get_messages, stream.id, cursor, limit=args.batch_size)
     next_cursor = require_cursor(response.headers.get('opc-next-cursor'))
-    capture_messages(state, response.data, args.otlp)
-    if response.data:
-        offsets[partition] = response.data[-1].offset
-    cursors[partition] = next_cursor
+    messages = response.data
+    if not isinstance(messages, list) or len(messages) > args.batch_size:
+        raise RuntimeError('OCI returned an unexpected message batch; no offsets committed')
+    capture_messages(state, messages, args.otlp)
+    if messages:
+        # Commit only after the batch has been processed and retained for display.
+        # The commit response cursor must be used on the next read.
+        next_cursor = require_cursor(requests.call(client.consumer_commit, stream.id, next_cursor).data.value)
+        with state.lock:
+            state.committed += len(messages)
+    return next_cursor
+
+
+def refresh_group(oci, client, requests, stream, args, state):
+    try:
+        data = requests.call(client.get_group, stream.id, args.group_name).data
+        status, reservations = 'active', oci.util.to_dict(data).get('reservations') or []
+    except oci.exceptions.ServiceError as error:
+        status = 'absent/inaccessible' if error.status == 404 else f'HTTP {error.status}'
+        reservations = []
+    except (oci.exceptions.RequestException, OSError) as error:
+        status, reservations = type(error).__name__, []
+    with state.lock:
+        state.group_status = status
+        state.reservations = reservations
+        state.group_updated = time.monotonic()
 
 
 def monitor(args, state, stop):
@@ -258,29 +301,30 @@ def monitor(args, state, stop):
         if not stream.partitions or stream.partitions < 1:
             raise RuntimeError('Stream has no partitions')
         client = oci.streaming.StreamClient(config, endpoint, **common)
-        cursors, offsets = {}, {}
-        index = 0
+        cursor = create_group_cursor(oci, client, requests, stream, args)
+        next_group_refresh = 0.0
+        recovered_cursor = False
         while not stop.is_set():
-            group = f'cp{index % 9 + 1}'
-            try:
-                data = requests.call(client.get_group, stream.id, group).data
-                result = ('found', oci.util.to_dict(data).get('reservations') or [], time.monotonic())
-            except oci.exceptions.ServiceError as error:
-                result = ('absent/inaccessible' if error.status == 404 else f'HTTP {error.status}', [], time.monotonic())
-            except (oci.exceptions.RequestException, OSError) as error:
-                result = (type(error).__name__, [], time.monotonic())
-            with state.lock:
-                state.groups[group] = result
-                state.status = f'{stream.name} | {config["region"]} | {stream.partitions} partitions | {endpoint}'
+            if time.monotonic() >= next_group_refresh:
+                refresh_group(oci, client, requests, stream, args, state)
+                next_group_refresh = time.monotonic() + 5
             if stop.is_set():
                 break
-            partition = str(index % stream.partitions)
+            with state.lock:
+                state.status = f'{stream.name} | {config["region"]} | {stream.partitions} partitions | {endpoint}'
             try:
-                poll_partition(oci, client, requests, stream, partition, cursors, offsets, args, state)
-            except (oci.exceptions.ServiceError, oci.exceptions.RequestException, OSError, RuntimeError) as error:
+                cursor = consume_batch(client, requests, stream, cursor, args, state)
+                recovered_cursor = False
+            except oci.exceptions.ServiceError as error:
+                # Rejoin the same explicitly supplied group after an expired
+                # cursor; its committed offsets, not a guessed partition, apply.
+                if error.status != 400 or recovered_cursor:
+                    raise
+                cursor = create_group_cursor(oci, client, requests, stream, args)
+                recovered_cursor = True
                 with state.lock:
-                    state.recent.append(safe_text(f'p{partition} READ ERROR: {error}')[:240])
-            index += 1
+                    state.status = 'Rejoined consumer group after invalid/expired cursor'
+
     except Cancelled:
         pass
     except Exception as error:
@@ -293,25 +337,32 @@ def monitor(args, state, stop):
                 resource.base_client.session.close()
 
 
-def dashboard_lines(state, args):
+def dashboard_lines(state, args, width=100):
     now = time.monotonic()
     with state.lock:
         elapsed = max(.001, now - state.started)
         lines = [f'OCI STREAM DASHBOARD | q quit | arrows/PgUp/PgDn scroll | {args.stream_name}',
                  safe_text(state.status),
-                 f'Preview: {state.messages:,} messages | {state.messages / elapsed:.1f} msg/s avg | '
+                 f'Group: {args.group_name} | instance: {args.instance_name}',
+                 f'Consumed: {state.messages:,} | committed: {state.committed:,} | '
+                 f'{state.messages / elapsed:.1f} msg/s avg | '
                  f'{state.payload_bytes / elapsed / 1048576:.3f} MiB/s avg',
                  f'OTLP records {state.records:,} | decode errors {state.decode_errors} | retries {state.retries}',
-                 f'Format: {"OTLP Logs JSON" if args.otlp else "raw"} | start: {args.cursor_type} | '
-                 '2 API calls/s | independent cursors; group offsets unchanged', '',
-                 'GROUP PART COMMIT OFFSET  RESERVED INSTANCE    AGE / STATUS']
-        for name, (status, reservations, updated) in state.groups.items():
-            age = f'{now - updated:.0f}s' if updated is not None else '-'
-            for reservation in reservations or [{}]:
-                lines.append(f'{name:<5} {str(reservation.get("partition", "-")):<4} '
-                             f'{str(reservation.get("committed_offset", "-")):<14} '
-                             f'{str(reservation.get("reserved_instance") or "-")[:20]:<20} {age} / {status}')
-        lines += ['', 'RECENT MESSAGE PREVIEW (last 100 lines; newest last)'] + list(state.recent)
+                 f'Format: {"OTLP Protobuf + gzip" if args.otlp else "raw"} | '
+                 f'new group: {args.cursor_type} | explicit commits | 2 API calls/s',
+                 'PART COMMIT OFFSET  RESERVED INSTANCE    GROUP STATUS / AGE']
+        age = f'{now - state.group_updated:.0f}s' if state.group_updated is not None else '-'
+        for reservation in state.reservations[:4] or [{}]:
+            lines.append(f'{str(reservation.get("partition", "-")):<4} '
+                         f'{str(reservation.get("committed_offset", "-")):<14} '
+                         f'{str(reservation.get("reserved_instance") or "-")[:20]:<20} '
+                         f'{state.group_status} / {age}')
+        if len(state.reservations) > 4:
+            lines.append(f'... {len(state.reservations) - 4} additional partition reservations')
+        lines += ['', 'LATEST CONSUMED MESSAGES (newest first; last 100 records retained)']
+        for message in reversed(state.recent):
+            lines.extend(textwrap.wrap(safe_text(message), width=max(1, width - 1),
+                                       subsequent_indent='  ') or [''])
         return [safe_text(line) for line in lines]
 
 
@@ -332,8 +383,8 @@ def run_screen(screen, args, state, stop):
     thread.start()
     try:
         while True:
-            lines = dashboard_lines(state, args)
             height, width = screen.getmaxyx()
+            lines = dashboard_lines(state, args, width)
             visible = max(1, height - 1)
             scroll = max(0, min(scroll, max(0, len(lines) - visible)))
             screen.erase()
@@ -363,13 +414,20 @@ def run_screen(screen, args, state, stop):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='getStreamConsumerDashboard.sh', description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('stream_name', help='exact stream name; monitor cp1 through cp9')
+    parser.add_argument('stream_name', help='exact stream name')
+    parser.add_argument('--group-name', required=True, help='exact consumer group name (required; no default)')
+    parser.add_argument('--instance-name', help='unique consumer instance name (default: dashboard-UUID)')
     parser.add_argument('--endpoint', choices=('private', 'public'), help='override .env endpoint type')
-    parser.add_argument('--otlp', action='store_true', help='decode stream values as OTLP Logs JSON')
+    parser.add_argument('--otlp', action='store_true', help='decode gzip-compressed OTLP Logs Protobuf (also accepts legacy JSON)')
     parser.add_argument('--cursor-type', choices=('LATEST', 'TRIM_HORIZON'), default='LATEST')
-    parser.add_argument('--batch-size', type=int, default=100, help='messages per preview read (default: 100; max: 10000)')
+    parser.add_argument('--batch-size', type=int, default=100, help='messages per group read (default: 100; max: 10000)')
     parser.add_argument('--dry-run', action='store_true', help='show plan without SDK import or network calls')
     args = parser.parse_args(argv)
+    if not args.group_name.strip():
+        parser.error('--group-name must not be empty')
+    if args.instance_name is not None and not args.instance_name.strip():
+        parser.error('--instance-name must not be empty')
+    args.instance_name = args.instance_name or 'dashboard-' + uuid.uuid4().hex
     args.compartment_id = (os.getenv('OCI_COMPARTMENT_ID') or '').strip()
     if not args.stream_name.strip() or not args.compartment_id:
         parser.error('provide a stream name and set OCI_COMPARTMENT_ID in .env beside this script')
@@ -384,8 +442,9 @@ def main(argv=None):
         args.endpoint = args.endpoint.rstrip('/')
     if args.dry_run:
         print(f'Dry run: instance principals; stream={args.stream_name}; endpoint={args.endpoint or "discover"}')
-        print(f'Groups: cp1-cp9; format: {"OTLP Logs JSON" if args.otlp else "raw"}; start: {args.cursor_type}')
-        print('Preview via independent partition cursors; no group joins or offset commits; 2 API calls/sec.')
+        print(f'Group: {args.group_name}; instance: {args.instance_name}; format: {"OTLP Logs Protobuf + gzip (or legacy JSON)" if args.otlp else "raw"}; start: {args.cursor_type}')
+        print('Join the specified consumer group; existing groups resume committed offsets; 2 API calls/sec.')
+        print('Decode and retain each batch, then explicitly commit offsets. Newest messages shown first.')
         print('Interactive dashboard: q quit; arrows/PgUp/PgDn scroll. No SDK import or network calls.')
         return 0
     stop = threading.Event()

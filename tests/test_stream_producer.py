@@ -1,8 +1,8 @@
 """Offline checks for the Python embedded in the standalone producer."""
 from contextlib import redirect_stderr, redirect_stdout
 import base64
+import gzip
 import io
-import json
 import os
 import signal
 import threading
@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+
+from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'runStreamProducerDemo.sh'
@@ -119,15 +121,15 @@ class EndpointTests(unittest.TestCase):
         self.assertIn('discover private endpoint', self.dry_run([], env))
         self.assertIn('discover public endpoint', self.dry_run(['--endpoint', 'public'], env))
 
-    def test_otlp_plan_accounts_for_envelope_and_inner_base64(self):
+    def test_otlp_plan_accounts_for_protobuf_and_gzip_overhead(self):
         self.assertIn('Format: raw bytes', self.dry_run([]))
         output = self.dry_run(['--otlp', '--message-size', '100000', '--batch-size', '100', '--rate', '0'])
-        self.assertIn('Format: OTLP Logs JSON', output)
-        self.assertIn('effective batch size: 7', output)
+        self.assertIn('Format: OTLP Logs Protobuf + gzip', output)
+        self.assertIn('effective batch size: 9', output)
         # Raw payload fits; its OTLP representation exceeds the request budget.
-        self.dry_run(['--message-size', '800000'])
+        self.dry_run(['--message-size', '999900'])
         with self.assertRaises(SystemExit) as error:
-            self.dry_run(['--otlp', '--message-size', '800000'])
+            self.dry_run(['--otlp', '--message-size', '999900'])
         self.assertEqual(error.exception.code, 2)
 
     def test_worker_publishes_otlp_envelope_and_counts_full_value_bytes(self):
@@ -148,17 +150,29 @@ class EndpointTests(unittest.TestCase):
                 self.assertEqual(len(messages), 2)
                 value = base64.b64decode(messages[0].value, validate=True)
                 if otlp:
-                    resource = json.loads(value)['resourceLogs'][0]
-                    record = resource['scopeLogs'][0]['logRecords'][0]
-                    self.assertEqual(record['timeUnixNano'], '1758112881118549000')
-                    self.assertEqual(record['severityNumber'], 9)
-                    self.assertEqual(base64.b64decode(record['body']['bytesValue']), b'\x00\xffabc')
-                    bound = len(PRODUCER['otlp_payload']('', 2**64 - 1)) + 8
+                    self.assertTrue(value.startswith(b'\x1f\x8b'))
+                    request = ExportLogsServiceRequest.FromString(gzip.decompress(value))
+                    self.assertEqual(request.resource_logs[0].resource.attributes[0].value.string_value,
+                                     'ocikit-stream-producer')
+                    record = request.resource_logs[0].scope_logs[0].log_records[0]
+                    self.assertEqual(record.time_unix_nano, 1758112881118549000)
+                    self.assertEqual(record.severity_number, 9)
+                    self.assertEqual(record.body.bytes_value, b'\x00\xffabc')
+                    bound = PRODUCER['otlp_payload_budget'](5)
                     self.assertLessEqual(len(value), bound)
                 else:
                     self.assertEqual(value, b'\x00\xffabc')
                 self.assertNotEqual(messages[0].key, messages[1].key)
                 self.assertEqual(metrics.snapshot()['payload_bytes'], 2 * len(value))
+
+    def test_otlp_budget_covers_incompressible_and_compressible_bodies(self):
+        for size in (1, 127, 128, 16384, 100000, 990000):
+            for body in (os.urandom(size), b'\0' * size):
+                with self.subTest(size=size, compressible=body[0] == 0):
+                    payload = PRODUCER['otlp_payload'](body, 2**64 - 1)
+                    self.assertLessEqual(len(payload), PRODUCER['otlp_payload_budget'](size))
+                    request = ExportLogsServiceRequest.FromString(gzip.decompress(payload))
+                    self.assertEqual(request.resource_logs[0].scope_logs[0].log_records[0].body.bytes_value, body)
 
     def test_url_override_and_invalid_directive(self):
         self.assertIn('Endpoint: https://messages.example.com\n',
@@ -181,15 +195,16 @@ class EndpointTests(unittest.TestCase):
         text = 'Welcome "visitor"!\n你好\n'
         with patch.dict(PRODUCER, {'motd_sample': lambda: (text, '/etc/motd')}):
             output = self.dry_run(['--otlp-sample', '--message-size', '9999999'])
-            self.assertIn('Format: OTLP Logs JSON', output)
+            self.assertIn('Format: OTLP Logs Protobuf + gzip', output)
             self.assertIn('maximum attempted: 1\n', output)
-            self.assertIn('MOTD sample: /etc/motd; body.stringValue', output)
-            budget = len(PRODUCER['otlp_payload']('', 2**64 - 1, body_text=text))
+            self.assertIn('MOTD sample: /etc/motd; body.string_value', output)
+            self.assertIn('MOTD message:\n' + text, output)
+            budget = PRODUCER['otlp_payload_budget'](len(text.encode()), body_text=text)
             self.assertIn(f'decoded value budget: <= {budget:,} bytes/message', output)
             self.assertIn('maximum attempted: 3\n', self.dry_run(['--otlp-sample', '--max-messages', '3']))
 
-    def test_sample_size_limit_includes_json_escaping(self):
-        with patch.dict(PRODUCER, {'motd_sample': lambda: ('\n' * 600000, '/etc/motd')}), \
+    def test_sample_size_limit_bounds_input_before_protobuf_allocation(self):
+        with patch.dict(PRODUCER, {'motd_sample': lambda: ('\n' * 1000001, '/etc/motd')}), \
              self.assertRaises(SystemExit) as error:
             self.dry_run(['--otlp-sample'])
         self.assertEqual(error.exception.code, 2)
@@ -211,9 +226,11 @@ class EndpointTests(unittest.TestCase):
         messages = client.put_messages.call_args.args[1].messages
         self.assertEqual(len(messages), 1)
         raw = base64.b64decode(messages[0].value, validate=True)
-        record = json.loads(raw)['resourceLogs'][0]['scopeLogs'][0]['logRecords'][0]
-        self.assertEqual(record['body'], {'stringValue': text})
-        self.assertGreater(int(record['timeUnixNano']), 0)
+        request = ExportLogsServiceRequest.FromString(gzip.decompress(raw))
+        record = request.resource_logs[0].scope_logs[0].log_records[0]
+        self.assertEqual(record.body.WhichOneof('value'), 'string_value')
+        self.assertEqual(record.body.string_value, text)
+        self.assertGreater(record.time_unix_nano, 0)
         self.assertEqual(metrics.snapshot()['payload_bytes'], len(raw))
 
 
