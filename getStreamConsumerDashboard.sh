@@ -4,6 +4,7 @@
 set -eu
 # Load deployment settings from .env beside this script, not the working directory.
 OCIKIT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export OCIKIT_DIR
 if [ -f "$OCIKIT_DIR/.env" ]; then
     set -a
     . "$OCIKIT_DIR/.env"
@@ -36,11 +37,11 @@ fi
 exec "$@" <<'OCI_STREAM_DASHBOARD_PY'
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["oci>=2.189.0,<3", "opentelemetry-proto>=1.28,<2"]
+# dependencies = ["oci>=2.189.0,<3", "opentelemetry-proto>=1.28,<2", "confluent-kafka>=2.12,<3"]
 # ///
 """Live OCI stream consumer dashboard. Press q to quit; arrows/PgUp/PgDn scroll.
 
-Usage: ./getStreamConsumerDashboard.sh STREAM_NAME --group-name GROUP [--otlp]
+Usage: ./getStreamConsumerDashboard.sh STREAM_NAME --group-name GROUP [--api oci|kafka-python|kafka-java] [--otlp]
 
 Use instance principals and .env beside the script (OCI_COMPARTMENT_ID,
 OCI_REGION, OCI_STREAM_ENDPOINT). Requires read streams, use stream-pull, and
@@ -48,7 +49,7 @@ read stream-pools for endpoint filtering. A private endpoint needs private DNS
 and network access. Specify the exact consumer group with --group-name; no
 names are guessed or probed. Each run joins with a unique consumer instance.
 
-Create a group cursor with commit_on_get=False. New groups start at LATEST by
+OCI mode creates a group cursor with commit_on_get=False. New groups start at LATEST by
 default; --cursor-type TRIM_HORIZON starts a new group at retained history.
 Existing groups resume committed offsets. Joining an existing group participates
 in its partition assignments alongside its other consumers. After decoding and
@@ -56,10 +57,22 @@ retaining each batch for display, explicitly commit its returned cursor. Decode
 errors are displayed and counted as handled messages. Delivery is at least once:
 quitting or a failure before commit can cause a batch to be delivered again.
 
-Poll only the named group's state, and consume through its group cursor at two
-API calls/second total, including commits. Counts/rates describe this process;
-reservation offsets describe the group. Latest messages appear first and wrap
+OCI mode polls only the named group's state. All modes cap application calls at
+two/second, including commits. Counts/rates describe this process;
+OCI reservation offsets describe the group. Latest messages appear first and wrap
 to the terminal width. The screen refreshes automatically every 100 ms.
+
+--api oci (default), kafka-python, or kafka-java matches runStreamConsumerDemo.sh.
+Keep stream_kafka.py beside both scripts. Kafka bootstrap servers are discovered
+from the stream pool, or overridden by --kafka-bootstrap-servers or
+OCI_KAFKA_BOOTSTRAP_SERVERS. Kafka requires read stream-pools for discovery.
+Python Kafka uses SASL_SSL/PLAIN: set OCI_KAFKA_USERNAME to
+tenancy/[domain/]user/streamPoolId and OCI_KAFKA_AUTH_TOKEN in .env. Java uses
+instance principals (OCI_RSA_SHA256) when no Kafka username is supplied; with a
+username it uses the same auth token. Java needs JDK 17+ and the bridge jar built
+by prepareOL.sh/prepareDebian.sh. Kafka client heartbeats/retries run separately
+from the two application calls/second cap. The Kafka table shows this process's
+committed next offsets; OCI mode shows group reservations returned by GetGroup.
 
 --otlp decodes gzip-compressed OTLP Logs binary Protobuf requests (or legacy JSON),
 including the producer's body.bytesValue and text body.stringValue. This is OCI
@@ -77,13 +90,18 @@ from collections import deque
 import curses
 import gzip
 import io
+import logging
+import math
 import json
 import os
+from pathlib import Path
 import signal
+import subprocess
 import sys
 import threading
 import textwrap
 import time
+from types import SimpleNamespace
 import uuid
 from urllib.parse import urlsplit
 
@@ -100,6 +118,7 @@ class State:
         self.reservations = []
         self.group_updated = None
         self.committed = 0
+        self.backend_process = None
         self.recent = deque(maxlen=100)
         self.messages = self.payload_bytes = self.records = self.decode_errors = 0
         self.retries = 0
@@ -112,11 +131,14 @@ class Requests:
         self.oci, self.stop, self.state = oci, stop, state
         self.next_call = 0.0
 
+    def wait(self):
+        if self.stop.wait(max(0, self.next_call - time.monotonic())):
+            raise Cancelled()
+        self.next_call = time.monotonic() + .5
+
     def call(self, method, *args, **kwargs):
         for attempt in range(4):
-            if self.stop.wait(max(0, self.next_call - time.monotonic())):
-                raise Cancelled()
-            self.next_call = time.monotonic() + .5
+            self.wait()
             try:
                 return method(*args, retry_strategy=self.oci.retry.NoneRetryStrategy(), **kwargs)
             except (self.oci.exceptions.ServiceError, self.oci.exceptions.RequestException, OSError) as error:
@@ -283,6 +305,90 @@ def refresh_group(oci, client, requests, stream, args, state):
         state.group_updated = time.monotonic()
 
 
+def kafka_helpers():
+    # Shared with runStreamConsumerDemo.sh; deploy stream_kafka.py alongside both.
+    sys.path.insert(0, os.environ.get('OCIKIT_DIR', str(Path.cwd())))
+    import stream_kafka
+    return stream_kafka
+
+
+def consume_kafka_batch(kafka, client, requests, stream, args, state):
+    requests.wait()
+    records = client.consume(num_messages=args.batch_size, timeout=args.poll_interval)
+    messages, offsets = [], {}
+    for record in records:
+        if record.error():
+            raise kafka.KafkaException(record.error())
+        value = record.value()
+        messages.append(SimpleNamespace(partition=record.partition(), offset=record.offset(),
+            value=base64.b64encode(value).decode('ascii') if value is not None else None))
+        partition = (record.topic(), record.partition())
+        offsets[partition] = max(offsets.get(partition, 0), record.offset() + 1)
+    capture_messages(state, messages, args.otlp)
+    if not messages:
+        return
+    requests.wait()
+    result = client.commit(offsets=[kafka.TopicPartition(topic, partition, offset)
+        for (topic, partition), offset in offsets.items()], asynchronous=False)
+    for partition in result or []:
+        if partition.error:
+            raise kafka.KafkaException(partition.error)
+    with state.lock:
+        state.committed += len(messages)
+        reservations = {str(item['partition']): item for item in state.reservations}
+        for (_, partition), offset in offsets.items():
+            reservations[str(partition)] = dict(partition=str(partition), committed_offset=offset,
+                                                reserved_instance=args.instance_name)
+        state.reservations = list(reservations.values())
+        state.group_updated = time.monotonic()
+
+
+def monitor_kafka(oci, admin, requests, stream, args, state, stop):
+    helpers = kafka_helpers()
+    pool = requests.call(admin.get_stream_pool, stream.stream_pool_id).data
+    bootstrap = args.kafka_bootstrap_servers or pool.kafka_settings.bootstrap_servers
+    if not bootstrap:
+        raise RuntimeError('Stream pool has no Kafka bootstrap servers')
+    if args.kafka_username and not args.kafka_username.endswith('/' + stream.stream_pool_id):
+        raise RuntimeError('Kafka username must end with / followed by the selected stream pool OCID')
+    args.stream_pool_id = stream.stream_pool_id
+    client = None
+    try:
+        if args.api == 'kafka-python':
+            try:
+                import confluent_kafka as kafka
+            except ImportError as error:
+                raise RuntimeError('Kafka client missing; rerun the preparation script or install confluent-kafka') from error
+            # librdkafka logs are delivered via poll to this logger, keeping the
+            # curses screen clean. Consume/commit exceptions still appear in UI.
+            logger = logging.getLogger('ocikit.dashboard.kafka')
+            logger.addHandler(logging.NullHandler())
+            logger.propagate = False
+            client = kafka.Consumer(helpers.kafka_config(args, bootstrap, args.instance_name), logger=logger)
+        else:
+            kafka = helpers.JAVA_KAFKA
+            def register_process(process):
+                # Register before bridge initialization, so q also stops a JVM
+                # that is still starting or authenticating.
+                with state.lock:
+                    state.backend_process = process
+                if stop.is_set() and process.poll() is None:
+                    process.terminate()
+            client = helpers.JavaKafkaClient(args, bootstrap, args.instance_name,
+                                            stderr=subprocess.DEVNULL, on_process=register_process)
+        client.subscribe([args.stream_name])
+        with state.lock:
+            state.status = f'{stream.name} | {args.api} | {bootstrap}'
+            state.group_status = 'subscribed; local commits'
+        while not stop.is_set():
+            consume_kafka_batch(kafka, client, requests, stream, args, state)
+    finally:
+        if client is not None:
+            client.close()
+        with state.lock:
+            state.backend_process = None
+
+
 def monitor(args, state, stop):
     admin = client = None
     try:
@@ -290,11 +396,14 @@ def monitor(args, state, stop):
         signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner(
             retry_strategy=oci.retry.NoneRetryStrategy(),
             federation_client_retry_strategy=oci.retry.NoneRetryStrategy())
-        common = dict(signer=signer, timeout=(5, 30), retry_strategy=oci.retry.NoneRetryStrategy())
+        common = dict(signer=signer, timeout=(args.connect_timeout, args.request_timeout), retry_strategy=oci.retry.NoneRetryStrategy())
         config = {'region': os.getenv('OCI_REGION') or signer.region}
         requests = Requests(oci, stop, state)
         admin = oci.streaming.StreamAdminClient(config, **common)
         stream = resolve_stream(admin, requests, args.stream_name, args.compartment_id, args.endpoint)
+        if args.api != 'oci':
+            monitor_kafka(oci, admin, requests, stream, args, state, stop)
+            return
         endpoint = stream.messages_endpoint if args.endpoint in (None, 'private', 'public') else args.endpoint
         if not endpoint:
             raise RuntimeError('Stream has no messages endpoint')
@@ -343,7 +452,7 @@ def dashboard_lines(state, args, width=100):
         elapsed = max(.001, now - state.started)
         lines = [f'OCI STREAM DASHBOARD | q quit | arrows/PgUp/PgDn scroll | {args.stream_name}',
                  safe_text(state.status),
-                 f'Group: {args.group_name} | instance: {args.instance_name}',
+                 f'API: {args.api} | group: {args.group_name} | instance: {args.instance_name}',
                  f'Consumed: {state.messages:,} | committed: {state.committed:,} | '
                  f'{state.messages / elapsed:.1f} msg/s avg | '
                  f'{state.payload_bytes / elapsed / 1048576:.3f} MiB/s avg',
@@ -407,6 +516,13 @@ def run_screen(screen, args, state, stop):
                 scroll = len(lines)
     finally:
         stop.set()
+        with state.lock:
+            process = state.backend_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass  # The Java bridge may have exited after poll().
         # Network I/O runs in a daemon so q restores the terminal immediately,
         # even during instance-principal authentication or a stalled SDK request.
 
@@ -417,12 +533,30 @@ def main(argv=None):
     parser.add_argument('stream_name', help='exact stream name')
     parser.add_argument('--group-name', required=True, help='exact consumer group name (required; no default)')
     parser.add_argument('--instance-name', help='unique consumer instance name (default: dashboard-UUID)')
+    parser.add_argument('--api', choices=('oci', 'kafka-python', 'kafka-java'), default='oci',
+                        help='consumer backend (default: oci)')
+    parser.add_argument('--kafka-username', default=os.getenv('OCI_KAFKA_USERNAME') or None,
+                        help='tenancy/[domain/]user/streamPoolId; Java uses instance principals when absent')
+    parser.add_argument('--kafka-bootstrap-servers', default=os.getenv('OCI_KAFKA_BOOTSTRAP_SERVERS') or None,
+                        help='override discovered Kafka host:port bootstrap servers')
+    parser.add_argument('--connect-timeout', type=float, default=5)
+    parser.add_argument('--request-timeout', type=float, default=30)
+    parser.set_defaults(poll_interval=1, time=None, debug=False)
     parser.add_argument('--endpoint', choices=('private', 'public'), help='override .env endpoint type')
     parser.add_argument('--otlp', action='store_true', help='decode gzip-compressed OTLP Logs Protobuf (also accepts legacy JSON)')
     parser.add_argument('--cursor-type', choices=('LATEST', 'TRIM_HORIZON'), default='LATEST')
     parser.add_argument('--batch-size', type=int, default=100, help='messages per group read (default: 100; max: 10000)')
     parser.add_argument('--dry-run', action='store_true', help='show plan without SDK import or network calls')
     args = parser.parse_args(argv)
+    args.kafka_username = (args.kafka_username or '').strip() or None
+    for value in (args.connect_timeout, args.request_timeout):
+        if not math.isfinite(value) or value <= 0:
+            parser.error('connect/request timeouts must be finite and positive')
+    if args.api != 'oci' and not args.dry_run:
+        if args.api == 'kafka-python' and not args.kafka_username:
+            parser.error('set OCI_KAFKA_USERNAME or provide --kafka-username for Python Kafka')
+        if args.kafka_username and not os.getenv('OCI_KAFKA_AUTH_TOKEN'):
+            parser.error('set OCI_KAFKA_AUTH_TOKEN when using a Kafka username')
     if not args.group_name.strip():
         parser.error('--group-name must not be empty')
     if args.instance_name is not None and not args.instance_name.strip():
@@ -434,6 +568,8 @@ def main(argv=None):
     if not 1 <= args.batch_size <= 10000:
         parser.error('--batch-size must be between 1 and 10000')
     args.endpoint = args.endpoint or (os.getenv('OCI_STREAM_ENDPOINT') or '').strip() or None
+    if args.api != 'oci' and args.endpoint and args.endpoint not in ('private', 'public'):
+        parser.error('Kafka APIs use endpoint private|public; use --kafka-bootstrap-servers for host:port overrides')
     if args.endpoint and args.endpoint not in ('private', 'public'):
         parsed = urlsplit(args.endpoint)
         if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or
@@ -441,8 +577,11 @@ def main(argv=None):
             parser.error('OCI_STREAM_ENDPOINT must be private, public, or an HTTPS messages endpoint URL')
         args.endpoint = args.endpoint.rstrip('/')
     if args.dry_run:
-        print(f'Dry run: instance principals; stream={args.stream_name}; endpoint={args.endpoint or "discover"}')
+        print(f'Dry run: api={args.api}; instance principals; stream={args.stream_name}; endpoint={args.endpoint or "discover"}')
         print(f'Group: {args.group_name}; instance: {args.instance_name}; format: {"OTLP Logs Protobuf + gzip (or legacy JSON)" if args.otlp else "raw"}; start: {args.cursor_type}')
+        if args.api != 'oci':
+            auth = 'SASL_SSL/PLAIN (OCI_KAFKA_AUTH_TOKEN)' if args.kafka_username or args.api == 'kafka-python' else 'SASL_SSL/OCI_RSA_SHA256 (instance principals; no auth token needed)'
+            print(f'Kafka: {auth}; bootstrap: {args.kafka_bootstrap_servers or "discover from stream pool"}')
         print('Join the specified consumer group; existing groups resume committed offsets; 2 API calls/sec.')
         print('Decode and retain each batch, then explicitly commit offsets. Newest messages shown first.')
         print('Interactive dashboard: q quit; arrows/PgUp/PgDn scroll. No SDK import or network calls.')

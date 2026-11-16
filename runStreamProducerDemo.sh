@@ -52,20 +52,21 @@ A private endpoint requires a private network path and DNS resolution from this 
 it does not change the pool's network configuration. With no endpoint directive,
 the stream's configured messages endpoint is discovered automatically.
 
-Payloads contain random bytes, reused within a worker.
-With --otlp, each value is a gzip-compressed, binary Protobuf
-ExportLogsServiceRequest containing one log record. Random bytes use body.bytes_value;
---message-size controls the raw body size before serialization and compression.
-Timestamps are refreshed per batch. The compressed bytes are base64-encoded only
-for OCI Streaming PutMessages transport to the selected OSS messages endpoint.
-Consumers must base64-decode, gunzip, then parse ExportLogsServiceRequest.
+Every message contains human-readable MOTD text. Read /etc/motd once per run;
+if it is missing or empty, generate a greeting. Raw mode sends its UTF-8 bytes.
+With --otlp, wrap the same text in body.string_value of an ExportLogsServiceRequest,
+serialize as binary Protobuf, then gzip. Timestamps are refreshed per batch.
+Base64 encoding is applied only for OCI Streaming PutMessages transport to the
+selected OSS messages endpoint. Consumers base64-decode, gunzip, then parse
+ExportLogsServiceRequest to recover the MOTD text.
 Format reference: https://opentelemetry.io/docs/specs/otlp/
 
---otlp-sample implies --otlp and replaces random bytes with a message of the day
-in body.string_value. Read /etc/motd once; if missing or empty, generate a greeting.
-Send one message by default; --max-messages overrides this count. --message-size
-is ignored in sample mode. Print the readable MOTD text before publishing (also
-in --dry-run). Existing duration, rate and endpoint options still apply.
+Without --message-size, use one complete MOTD per message. An explicit
+--message-size requests a minimum UTF-8 body size by repeating complete MOTDs,
+separated by newlines; text is never truncated. --otlp-sample implies --otlp,
+ignores --message-size, prints the readable MOTD (also in --dry-run), and sends
+one message by default; --max-messages overrides this count. Existing duration,
+rate and endpoint options still apply.
 
 Unique keys spread load
 across partitions; --key deliberately puts the load on one partition. A batch
@@ -258,14 +259,14 @@ def motd_sample():
         return text, '/etc/motd'
     today = time.strftime('%Y-%m-%d', time.gmtime())
     return (f'Message of the day ({today} UTC): Hello from OCIKit! '
-            'This sample log was published to OCI Streaming using gzip-compressed OTLP Logs Protobuf.', 'generated greeting')
+            'This is a human-readable MOTD message from OCIKit.', 'generated greeting')
 
 
 def worker(oci, client, args, allocator, metrics, stop, run_id, worker_id):
-    sample_text = getattr(args, 'sample_text', None)
-    body = os.urandom(args.message_size) if sample_text is None else b''
+    message_text = args.message_text
+    body = message_text.encode('utf-8')
     payload = base64.b64encode(body).decode('ascii')
-    payload_size = args.message_size
+    payload_size = len(body)
     while not stop.is_set():
         allocation = allocator.claim()
         if allocation is None:
@@ -276,7 +277,7 @@ def worker(oci, client, args, allocator, metrics, stop, run_id, worker_id):
         if time.monotonic() >= allocator.deadline:
             return
         if args.otlp:
-            value = otlp_payload(body, time.time_ns(), body_text=sample_text)
+            value = otlp_payload(b'', time.time_ns(), body_text=message_text)
             payload_size = len(value)
             payload = base64.b64encode(value).decode('ascii')
         messages = []
@@ -387,8 +388,8 @@ def stress(oci, clients, args, batch_size, run_id):
                'batch_size': batch_size, 'target_messages_per_second': args.rate,
                'interrupted': interrupted.is_set(), **snapshot}
     summary['payload_format'] = 'otlp-protobuf-gzip' if getattr(args, 'otlp', False) else 'raw'
-    if getattr(args, 'otlp_sample', False):
-        summary['sample_source'] = args.sample_source
+    summary['message_content'] = 'motd'
+    summary['message_source'] = getattr(args, 'message_source', None)
     if args.json_report:
         args.json_report.expanduser().write_text(json.dumps(summary, indent=2) + '\n')
         print('JSON report: ' + str(args.json_report.expanduser()))
@@ -457,8 +458,8 @@ def main(argv=None):
                         help='seconds to start new requests (default: run continuously until Ctrl-C)')
     parser.add_argument('--workers', type=positive_int, default=4, help='concurrent SDK clients (default: 4)')
     parser.add_argument('--batch-size', type=positive_int, default=100, help='maximum messages/request; shrinks to fit 1 MB (default: 100)')
-    parser.add_argument('--message-size', type=positive_int, default=1024,
-                        help='random body bytes/message, before OTLP wrapping if enabled (default: 1024)')
+    parser.add_argument('--message-size', type=positive_int,
+                        help='minimum UTF-8 body bytes by repeating complete MOTDs (default: one MOTD)')
     parser.add_argument('--otlp', action='store_true',
                         help='serialize each message as OTLP Logs binary Protobuf, gzip, and publish via Streaming')
     parser.add_argument('--otlp-sample', action='store_true',
@@ -489,27 +490,34 @@ def main(argv=None):
     key_budget = KEY_BUDGET if args.key is None else len(args.key.encode('utf-8'))
     if args.key == '':
         parser.error('--key must not be empty')
-    args.sample_text = None
+    requested_size = args.message_size
     if args.otlp_sample:
         args.otlp = True
         if args.max_messages is None:
             args.max_messages = 1
-        try:
-            args.sample_text, args.sample_source = motd_sample()
-        except OSError as error:
-            parser.error(f'cannot read /etc/motd: {error}')
-        args.message_size = len(args.sample_text.encode('utf-8'))
+    elif requested_size is not None and requested_size > MAX_BATCH_BYTES:
+        parser.error('message body exceeds the 1 MB decoded request budget')
+    try:
+        args.message_text, args.message_source = motd_sample()
+    except OSError as error:
+        parser.error(f'cannot read /etc/motd: {error}')
+    if not args.otlp_sample and requested_size is not None:
+        if len(args.message_text.encode('utf-8')) < requested_size:
+            unit = args.message_text if args.message_text.endswith('\n') else args.message_text + '\n'
+            unit_size = len(unit.encode('utf-8'))
+            args.message_text = unit * ((requested_size + unit_size - 1) // unit_size)
+    args.message_size = len(args.message_text.encode('utf-8'))
     # Bound raw input before allocating a sizing request. Conservative batching
     # includes Protobuf and worst-case gzip overhead within the decoded OSS limit.
     if args.message_size > MAX_BATCH_BYTES:
         parser.error('message body exceeds the 1 MB decoded request budget')
     try:
-        payload_budget = (otlp_payload_budget(args.message_size, body_text=args.sample_text)
+        payload_budget = (otlp_payload_budget(args.message_size, body_text=args.message_text)
                           if args.otlp else args.message_size)
     except RuntimeError as error:
         parser.error(str(error))
     per_message = key_budget + payload_budget
-    payload_format = 'OTLP Logs Protobuf + gzip' if args.otlp else 'raw bytes'
+    payload_format = 'OTLP Logs Protobuf + gzip' if args.otlp else 'raw UTF-8 MOTD'
     if per_message > MAX_BATCH_BYTES:
         parser.error('message plus key exceeds the 1 MB decoded request budget')
     batch_size = min(args.batch_size, MAX_BATCH_BYTES // per_message)
@@ -531,8 +539,8 @@ def main(argv=None):
         print(f'Duration: {duration_plan}; workers: {args.workers}; effective batch size: {batch_size}; payload: {args.message_size} bytes')
         print(f'Format: {payload_format}; decoded value budget: <= {payload_budget:,} bytes/message')
         if args.otlp_sample:
-            print(f'MOTD sample: {args.sample_source}; body.string_value; {args.message_size} UTF-8 bytes')
-            print('MOTD message:\n' + args.sample_text)
+            print(f'MOTD sample: {args.message_source}; body.string_value; {args.message_size} UTF-8 bytes')
+            print('MOTD message:\n' + args.message_text)
         print(f'Rate: {args.rate:g} messages/sec (0=unlimited); maximum attempted: {args.max_messages or "unlimited"}')
         print(f'Decoded batch budget: <= {batch_size * per_message:,} bytes; keys: {"fixed/single partition" if args.key is not None else "unique/distributed"}')
         print('No SDK import, instance metadata requests, authentication, publication or report writes.')
@@ -569,8 +577,8 @@ def main(argv=None):
               f'duration: {duration_plan}; rate: {args.rate:g} msg/s (0=unlimited)', flush=True)
         print(f'Format: {payload_format}; decoded value budget: <= {payload_budget:,} bytes/message', flush=True)
         if args.otlp_sample:
-            print(f'MOTD sample: {args.sample_source}; body.string_value; {args.message_size} UTF-8 bytes', flush=True)
-            print('MOTD message:\n' + args.sample_text, flush=True)
+            print(f'MOTD sample: {args.message_source}; body.string_value; {args.message_size} UTF-8 bytes', flush=True)
+            print('MOTD message:\n' + args.message_text, flush=True)
         clients = []
         try:
             for _ in range(args.workers):

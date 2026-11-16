@@ -88,7 +88,9 @@ class DashboardTests(unittest.TestCase):
 
     def args(self, **overrides):
         settings = dict(stream_name='events', group_name='orders', instance_name='dashboard-test',
-            compartment_id='c', endpoint=None, cursor_type='LATEST', batch_size=100, otlp=False)
+            compartment_id='c', endpoint=None, cursor_type='LATEST', batch_size=100, otlp=False,
+            api='oci', connect_timeout=5, request_timeout=30, poll_interval=1, time=None, debug=False,
+            kafka_username=None, kafka_bootstrap_servers=None)
         settings.update(overrides)
         return SimpleNamespace(**settings)
 
@@ -151,7 +153,7 @@ class DashboardTests(unittest.TestCase):
         state.reservations = [{'partition': '0', 'committed_offset': 42, 'reserved_instance': 'worker\x1b'}]
         state.recent.extend(['old-message', 'new-message'])
         text = '\n'.join(MODULE['dashboard_lines'](state, self.args()))
-        self.assertIn('Group: orders', text)
+        self.assertIn('group: orders', text)
         self.assertNotIn('cp1', text)
         self.assertNotIn('cp9', text)
         self.assertIn('42', text)
@@ -177,6 +179,34 @@ class DashboardTests(unittest.TestCase):
              patch.object(MODULE['curses'], 'has_colors', return_value=False):
             self.assertEqual(MODULE['run_screen'](screen, args, MODULE['State'](), stop), 0)
         self.assertTrue(stop.is_set())
+
+    def test_q_terminates_active_java_bridge(self):
+        screen, stop, state = Mock(), threading.Event(), MODULE['State']()
+        screen.getmaxyx.return_value = (24, 100)
+        screen.getch.return_value = ord('q')
+        state.backend_process = process = Mock()
+        process.poll.return_value = None
+        with patch.dict(MODULE, {'monitor': lambda *unused: stop.wait(2)}), \
+             patch.object(MODULE['curses'], 'curs_set'), \
+             patch.object(MODULE['curses'], 'has_colors', return_value=False):
+            MODULE['run_screen'](screen, self.args(api='kafka-java'), state, stop)
+        process.terminate.assert_called_once()
+
+    def test_kafka_batch_commits_highest_next_offset_for_each_partition(self):
+        kafka, client, requests, state = Mock(), Mock(), Mock(), MODULE['State']()
+        records = []
+        for partition, offset in ((0, 1), (1, 10), (0, 5)):
+            record = Mock()
+            record.partition.return_value, record.offset.return_value = partition, offset
+            record.topic.return_value, record.value.return_value, record.error.return_value = 'events', b'hello', None
+            records.append(record)
+        client.consume.return_value = records
+        client.commit.return_value = []
+        MODULE['consume_kafka_batch'](kafka, client, requests, None, self.args(), state)
+        self.assertEqual([call.args for call in kafka.TopicPartition.call_args_list],
+                         [('events', 0, 6), ('events', 1, 11)])
+        self.assertEqual(state.committed, 3)
+        self.assertEqual(requests.wait.call_count, 2)
 
     def test_auto_refresh_displays_new_message_without_scrolling(self):
         screen, stop, state = Mock(), threading.Event(), MODULE['State']()
@@ -269,6 +299,105 @@ class DashboardTests(unittest.TestCase):
 
     def test_expired_cursor_rejoins_only_the_specified_group(self):
         self.run_monitor(expired=True)
+
+    def test_each_api_can_dry_run_without_credentials_or_sdk(self):
+        for api in ('oci', 'kafka-python', 'kafka-java'):
+            with self.subTest(api=api), patch.dict(os.environ, {'OCI_COMPARTMENT_ID': 'c'}, clear=True), \
+                 patch.dict('sys.modules', {'oci': None, 'confluent_kafka': None}), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(MODULE['main'](['events', '--group-name', 'orders', '--api', api, '--dry-run']), 0)
+            self.assertIn('api=' + api, output.getvalue())
+            if api == 'kafka-java':
+                self.assertIn('OCI_RSA_SHA256', output.getvalue())
+            if api == 'kafka-python':
+                self.assertIn('SASL_SSL/PLAIN', output.getvalue())
+
+    def test_kafka_credentials_and_endpoint_validation(self):
+        cases = [(['--api', 'kafka-python'], {}),
+                 (['--api', 'kafka-python', '--kafka-username', 'tenant/user/pool'], {}),
+                 (['--api', 'kafka-java', '--kafka-username', 'tenant/user/pool'], {}),
+                 (['--api', 'kafka-python', '--dry-run'], {'OCI_STREAM_ENDPOINT': 'https://messages.example.com'}),
+                 (['--api', 'unsupported', '--dry-run'], {})]
+        for options, env in cases:
+            with self.subTest(options=options), \
+                 patch.dict(os.environ, {'OCI_COMPARTMENT_ID': 'c', **env}, clear=True), \
+                 redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                MODULE['main'](['events', '--group-name', 'orders', *options])
+            self.assertEqual(error.exception.code, 2)
+
+    def test_kafka_monitors_discover_bootstrap_decode_and_commit_for_each_backend(self):
+        source = SCRIPT.with_name('runStreamProducerDemo.sh').read_text().split("<<'OCI_STREAM_PRODUCER_PY'\n", 1)[1].rsplit('\nOCI_STREAM_PRODUCER_PY', 1)[0]
+        producer = {'__name__': 'producer'}
+        exec(compile(source, 'producer', 'exec'), producer)
+        for api in ('kafka-python', 'kafka-java'):
+            for otlp in (False, True):
+                with self.subTest(api=api, otlp=otlp):
+                    oci, kafka, stop, state = Mock(), Mock(), threading.Event(), MODULE['State']()
+                    oci.exceptions.ServiceError = ServiceError
+                    oci.exceptions.RequestException = ConnectionError
+                    oci.auth.signers.InstancePrincipalsSecurityTokenSigner.return_value.region = 'test-region'
+                    admin = oci.streaming.StreamAdminClient.return_value
+                    stream = SimpleNamespace(id='stream', name='events', partitions=2, stream_pool_id='pool',
+                        messages_endpoint='https://messages.example.com', lifecycle_state='ACTIVE')
+                    admin.list_streams.return_value = SimpleNamespace(data=[stream], headers={})
+                    admin.get_stream.return_value.data = stream
+                    admin.get_stream_pool.return_value.data.kafka_settings.bootstrap_servers = 'kafka.example.com:9092'
+                    record, client = Mock(), Mock()
+                    record.topic.return_value = 'events'
+                    record.partition.return_value, record.offset.return_value, record.error.return_value = 0, 42, None
+                    record.value.return_value = (producer['otlp_payload'](b'', 123, body_text='Message of the day: Hello!')
+                                                if otlp else b'Message of the day: Hello!')
+                    client.consume.return_value = [record]
+                    client.commit.side_effect = lambda **kwargs: stop.set() or []
+                    kafka.Consumer.return_value = client
+                    kafka.TopicPartition.side_effect = lambda topic, partition, offset: SimpleNamespace(
+                        topic=topic, partition=partition, offset=offset)
+                    class ImmediateRequests:
+                        def __init__(self, *unused): pass
+                        def wait(self): pass
+                        def call(self, method, *args, **kwargs): return method(*args, **kwargs)
+                    import stream_kafka
+                    args = self.args(api=api, otlp=otlp,
+                        kafka_username='tenant/user/pool' if api == 'kafka-python' else None)
+                    with patch.dict('sys.modules', {'oci': oci, 'confluent_kafka': kafka}), \
+                         patch.dict(MODULE, {'Requests': ImmediateRequests}), \
+                         patch.object(stream_kafka, 'JavaKafkaClient', return_value=client) as java_factory, \
+                         patch.dict(os.environ, {'OCI_KAFKA_AUTH_TOKEN': 'test-token'}):
+                        MODULE['monitor'](args, state, stop)
+                    self.assertFalse(state.fatal, state.status)
+                    self.assertEqual((state.messages, state.committed), (1, 1))
+                    self.assertIn('Message of the day: Hello!', state.recent[0])
+                    self.assertEqual(state.reservations[0]['committed_offset'], 43)
+                    self.assertEqual(client.commit.call_args.kwargs['offsets'][0].offset, 43)
+                    client.subscribe.assert_called_once_with(['events'])
+                    client.close.assert_called_once()
+                    admin.base_client.session.close.assert_called_once()
+                    oci.streaming.StreamClient.assert_not_called()
+                    if api == 'kafka-python':
+                        config = kafka.Consumer.call_args.args[0]
+                        self.assertEqual(config['group.id'], 'orders')
+                        self.assertEqual(config['bootstrap.servers'], 'kafka.example.com:9092')
+                        self.assertFalse(config['enable.auto.commit'])
+                        java_factory.assert_not_called()
+                    else:
+                        self.assertEqual(java_factory.call_args.args[1], 'kafka.example.com:9092')
+                        self.assertIsNone(java_factory.call_args.args[0].kafka_username)
+
+    def test_kafka_record_and_commit_errors_do_not_increment_committed_count(self):
+        for failure in ('record', 'commit'):
+            with self.subTest(failure=failure):
+                kafka, client, requests, state = Mock(), Mock(), Mock(), MODULE['State']()
+                kafka.KafkaException = RuntimeError
+                record = Mock()
+                record.error.return_value = 'read failed' if failure == 'record' else None
+                record.value.return_value = b'hello'
+                record.partition.return_value, record.offset.return_value, record.topic.return_value = 0, 1, 'events'
+                client.consume.return_value = [record]
+                client.commit.side_effect = RuntimeError('commit failed')
+                with self.assertRaises(RuntimeError):
+                    MODULE['consume_kafka_batch'](kafka, client, requests, None, self.args(), state)
+                self.assertEqual(state.committed, 0)
+                if failure == 'record':
+                    client.commit.assert_not_called()
 
 
 if __name__ == '__main__':

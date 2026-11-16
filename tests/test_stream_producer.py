@@ -122,20 +122,22 @@ class EndpointTests(unittest.TestCase):
         self.assertIn('discover public endpoint', self.dry_run(['--endpoint', 'public'], env))
 
     def test_otlp_plan_accounts_for_protobuf_and_gzip_overhead(self):
-        self.assertIn('Format: raw bytes', self.dry_run([]))
-        output = self.dry_run(['--otlp', '--message-size', '100000', '--batch-size', '100', '--rate', '0'])
-        self.assertIn('Format: OTLP Logs Protobuf + gzip', output)
-        self.assertIn('effective batch size: 9', output)
-        # Raw payload fits; its OTLP representation exceeds the request budget.
-        self.dry_run(['--message-size', '999900'])
-        with self.assertRaises(SystemExit) as error:
-            self.dry_run(['--otlp', '--message-size', '999900'])
-        self.assertEqual(error.exception.code, 2)
+        with patch.dict(PRODUCER, {'motd_sample': lambda: ('motd\n', '/etc/motd')}):
+            self.assertIn('Format: raw UTF-8 MOTD', self.dry_run([]))
+            output = self.dry_run(['--otlp', '--message-size', '100000', '--batch-size', '100', '--rate', '0'])
+            self.assertIn('Format: OTLP Logs Protobuf + gzip', output)
+            self.assertIn('effective batch size: 9', output)
+            # Raw payload fits; its OTLP representation exceeds the request budget.
+            self.dry_run(['--message-size', '999900'])
+            with self.assertRaises(SystemExit) as error:
+                self.dry_run(['--otlp', '--message-size', '999900'])
+            self.assertEqual(error.exception.code, 2)
 
     def test_worker_publishes_otlp_envelope_and_counts_full_value_bytes(self):
         for otlp in (False, True):
             with self.subTest(otlp=otlp):
-                args = SimpleNamespace(message_size=5, otlp=otlp, key=None,
+                text = 'Message of the day: Welcome! 你好\n'
+                args = SimpleNamespace(message_size=len(text.encode()), message_text=text, otlp=otlp, key=None,
                                        stream_id='stream', error_backoff=0)
                 oci, client = Mock(), Mock()
                 oci.streaming.models.PutMessagesDetailsEntry.side_effect = lambda **kw: SimpleNamespace(**kw)
@@ -143,9 +145,10 @@ class EndpointTests(unittest.TestCase):
                 client.put_messages.return_value.data.entries = [SimpleNamespace(error=None, partition='0')] * 2
                 allocator = PRODUCER['Allocator'](float('inf'), 2, 0, 2, time.monotonic())
                 metrics = PRODUCER['Metrics']()
-                with patch.object(PRODUCER['os'], 'urandom', return_value=b'\x00\xffabc'), \
+                with patch.object(PRODUCER['os'], 'urandom') as random_bytes, \
                      patch.object(PRODUCER['time'], 'time_ns', return_value=1758112881118549000):
                     PRODUCER['worker'](oci, client, args, allocator, metrics, threading.Event(), 'run', 0)
+                random_bytes.assert_not_called()
                 messages = client.put_messages.call_args.args[1].messages
                 self.assertEqual(len(messages), 2)
                 value = base64.b64decode(messages[0].value, validate=True)
@@ -157,11 +160,12 @@ class EndpointTests(unittest.TestCase):
                     record = request.resource_logs[0].scope_logs[0].log_records[0]
                     self.assertEqual(record.time_unix_nano, 1758112881118549000)
                     self.assertEqual(record.severity_number, 9)
-                    self.assertEqual(record.body.bytes_value, b'\x00\xffabc')
-                    bound = PRODUCER['otlp_payload_budget'](5)
+                    self.assertEqual(record.body.WhichOneof('value'), 'string_value')
+                    self.assertEqual(record.body.string_value, text)
+                    bound = PRODUCER['otlp_payload_budget'](len(text.encode()), body_text=text)
                     self.assertLessEqual(len(value), bound)
                 else:
-                    self.assertEqual(value, b'\x00\xffabc')
+                    self.assertEqual(value.decode('utf-8'), text)
                 self.assertNotEqual(messages[0].key, messages[1].key)
                 self.assertEqual(metrics.snapshot()['payload_bytes'], 2 * len(value))
 
@@ -191,6 +195,31 @@ class EndpointTests(unittest.TestCase):
                 self.assertEqual(source, 'generated greeting')
                 self.assertIn('Message of the day', text)
 
+    def test_default_body_is_one_complete_motd_in_raw_and_otlp_modes(self):
+        text = 'Message of the day: Welcome! 你好\n'
+        for options in ([], ['--otlp']):
+            with patch.dict(PRODUCER, {'motd_sample': lambda: (text, '/etc/motd')}):
+                output = self.dry_run(options)
+                self.assertIn(f'payload: {len(text.encode())} bytes', output)
+                self.assertIn('maximum attempted: unlimited', output)
+                if options:
+                    # Planning and publishing must size the exact same text.
+                    budget = PRODUCER['otlp_payload_budget'](len(text.encode()), body_text=text)
+                    self.assertIn(f'decoded value budget: <= {budget:,}', output)
+
+    def test_message_size_repeats_complete_utf8_motds_without_truncation(self):
+        captured = {}
+        real_budget = PRODUCER['otlp_payload_budget']
+        def budget(size, *, body_text=None):
+            captured['text'] = body_text
+            return real_budget(size, body_text=body_text)
+        text = 'MOTD: 你好!'
+        with patch.dict(PRODUCER, {'motd_sample': lambda: (text, '/etc/motd'), 'otlp_payload_budget': budget}):
+            self.dry_run(['--otlp', '--message-size', '100'])
+        message = captured['text']
+        self.assertGreaterEqual(len(message.encode('utf-8')), 100)
+        self.assertEqual(message, (text + '\n') * (len(message) // len(text + '\n')))
+
     def test_sample_implies_otlp_defaults_to_one_and_allows_repeat_count(self):
         text = 'Welcome "visitor"!\n你好\n'
         with patch.dict(PRODUCER, {'motd_sample': lambda: (text, '/etc/motd')}):
@@ -211,7 +240,7 @@ class EndpointTests(unittest.TestCase):
 
     def test_worker_pushes_motd_as_otlp_text_and_counts_serialized_bytes(self):
         text = 'Message of the day: 你好!\nWelcome "visitor".\n'
-        args = SimpleNamespace(message_size=len(text.encode()), sample_text=text, otlp=True,
+        args = SimpleNamespace(message_size=len(text.encode()), message_text=text, otlp=True,
                                key=None, stream_id='stream', error_backoff=0)
         oci, client = Mock(), Mock()
         oci.streaming.models.PutMessagesDetailsEntry.side_effect = lambda **kw: SimpleNamespace(**kw)

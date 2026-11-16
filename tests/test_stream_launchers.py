@@ -20,6 +20,7 @@ class LauncherTests(unittest.TestCase):
                     deployment.mkdir()
                     caller.mkdir()
                     shutil.copy2(ROOT / script, deployment / script)
+                    shutil.copy2(ROOT / 'stream_kafka.py', deployment / 'stream_kafka.py')
                     (deployment / '.env').write_text('OCI_COMPARTMENT_ID=offline-compartment\n')
                     environment = {'caller': caller / '.venv', 'adjacent': deployment / '.venv',
                                    'active': root / 'active-environment'}[selection]
