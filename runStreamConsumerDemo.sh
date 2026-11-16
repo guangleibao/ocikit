@@ -62,7 +62,8 @@ new reads; in-flight reads and commits drain to their timeouts. --max-messages
 also stops the run when the requested number of messages has been consumed.
 Ctrl-C/SIGTERM drains fetched batches and exits 130. Metrics are per this process,
 not the entire consumer group. Messages are printed as JSON lines to stdout;
-Keys remain base64; values show the first 10 base64 characters followed by "...".
+Keys remain base64; UTF-8 values show the complete decoded message text.
+Non-UTF-8 values show an explicitly labeled base64 preview (up to 64 characters).
 Runtime status and metrics go to stderr.
 Use --no-print-messages to consume without printing messages.
 
@@ -222,6 +223,19 @@ def require_cursor(cursor):
     return cursor
 
 
+def display_message(message):
+    """Decode the SDK's base64 value for display without changing wire encoding."""
+    raw = base64.b64decode(message.value or '', validate=True)
+    result = dict(partition=message.partition, offset=message.offset, key=message.key)
+    try:
+        result['value'] = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        value = message.value or ''
+        result.update(value=value[:64] + ('...' if len(value) > 64 else ''),
+                      value_encoding='base64', value_truncated=len(value) > 64)
+    return result
+
+
 class RetryCancelled(Exception):
     """A retryable read or cursor operation was stopped before completion."""
 
@@ -308,8 +322,7 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
                 if args.print_messages:
                     with output_lock:
                         for message in messages:
-                            print(json.dumps(dict(partition=message.partition, offset=message.offset,
-                                                  key=message.key, value=(message.value or '')[:10] + '...')), flush=True)
+                            print(json.dumps(display_message(message), ensure_ascii=False), flush=True)
                 state.record(messages, payload_bytes)
                 # Commit the returned cursor, including the last batch before stopping.
                 if messages:
@@ -393,8 +406,7 @@ def kafka_worker(kafka, client, args, state, stop, deadline, instance_name, outp
                 if args.print_messages:
                     with output_lock:
                         for message in messages:
-                            print(json.dumps(dict(partition=message.partition, offset=message.offset,
-                                key=message.key, value=(message.value or '')[:10] + '...')), flush=True)
+                            print(json.dumps(display_message(message), ensure_ascii=False), flush=True)
                 state.record(messages, payload_bytes)
                 if messages:
                     state.pacer.wait()  # Final commits also share the process-wide rate cap.
@@ -563,7 +575,7 @@ def main(argv=None):
     parser.add_argument('--connect-timeout', type=positive_float, default=5)
     parser.add_argument('--request-timeout', type=positive_float, default=30)
     parser.add_argument('--print-messages', action=argparse.BooleanOptionalAction, default=True,
-                        help='print JSON messages to stdout; base64 values show a 10-character prefix plus ... (default: enabled)')
+                        help='print JSON messages with decoded UTF-8 values; binary values use a labeled base64 preview (default: enabled)')
     parser.add_argument('--json-report', type=Path, help='save final metrics as JSON to this local file')
     parser.add_argument('--debug', action='store_true', help='enable SDK debug logging')
     parser.add_argument('--dry-run', action='store_true', help='show plan without importing OCI, authenticating or consuming')

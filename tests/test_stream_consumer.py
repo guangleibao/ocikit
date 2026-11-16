@@ -2,6 +2,7 @@
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 import io
+import base64
 import json
 import os
 import signal
@@ -29,6 +30,24 @@ class ServiceFailure(Exception):
 
 
 class ConsumerTests(unittest.TestCase):
+    def test_display_decodes_full_motd_text_instead_of_base64_prefix(self):
+        text = '\nThe programs on this system welcome you. 你好!\nMessage of the day.\n'
+        message = SimpleNamespace(partition='0', offset=42, key='aw==',
+                                  value=base64.b64encode(text.encode('utf-8')).decode('ascii'))
+        self.assertTrue(message.value.startswith('ClRoZSBwcm'))
+        displayed = CONSUMER['display_message'](message)
+        self.assertEqual(displayed['value'], text)
+        self.assertNotIn('value_encoding', displayed)
+
+    def test_display_labels_binary_payload_preview(self):
+        raw = b'\xff\x00' * 100
+        message = SimpleNamespace(partition='0', offset=42, key=None,
+                                  value=base64.b64encode(raw).decode('ascii'))
+        displayed = CONSUMER['display_message'](message)
+        self.assertEqual(displayed['value_encoding'], 'base64')
+        self.assertTrue(displayed['value_truncated'])
+        self.assertEqual(displayed['value'], message.value[:64] + '...')
+
     def setUp(self):
         self.oci = Mock()
         self.client = Mock()
@@ -153,7 +172,7 @@ class ConsumerTests(unittest.TestCase):
             summary = json.loads(path.read_text())
         messages = [json.loads(line) for line in output.splitlines()]
         self.assertEqual(len(messages), 3)
-        self.assertEqual(messages[0], dict(partition='0', offset=1, key='aw==', value='aGVsbG8gd2...'))
+        self.assertEqual(messages[0], dict(partition='0', offset=1, key='aw==', value='hello world'))
         self.assertIn('FINAL', self.stderr_output)
         self.assertIn('Messages endpoint:', self.stderr_output)
         self.assertEqual((summary['consumed'], summary['committed']), (3, 3))
@@ -202,7 +221,7 @@ class ConsumerTests(unittest.TestCase):
                                '--workers', '1', '--max-messages', '1', '--request-rate', '1000'],
                               {'OCI_KAFKA_USERNAME': 'tenant/user/pool', 'OCI_KAFKA_AUTH_TOKEN': 'secret-token'})
         message = json.loads(output)
-        self.assertEqual(message['value'], 'aGVsbG8gd2...')
+        self.assertEqual(message['value'], 'hello world')
         config = kafka.Consumer.call_args.args[0]
         self.assertEqual(config['bootstrap.servers'], 'private.kafka.example:9092')
         self.assertEqual(config['security.protocol'], 'SASL_SSL')
@@ -313,7 +332,7 @@ class ConsumerTests(unittest.TestCase):
             output = self.cli(['events', '--api', 'kafka-java', '--group-name', 'group', '--endpoint', 'private',
                 '--workers', '1', '--max-messages', '1', '--request-rate', '1000'],
                 {'OCI_KAFKA_USERNAME': 'tenant/user/pool', 'OCI_KAFKA_AUTH_TOKEN': 'secret-token'})
-        self.assertEqual(json.loads(output)['value'], 'aGVsbG8gd2...')
+        self.assertEqual(json.loads(output)['value'], 'hello world')
         self.assertEqual(factory.call_args.args[1], 'host:9092')
         self.assertEqual(factory.call_args.args[0].api, 'kafka-java')
         offset = client.commit.call_args.kwargs['offsets'][0]
