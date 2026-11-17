@@ -31,7 +31,7 @@ class ServiceFailure(Exception):
 
 class ConsumerTests(unittest.TestCase):
     def test_display_decodes_full_motd_text_instead_of_base64_prefix(self):
-        text = '\nThe programs on this system welcome you. 你好!\nMessage of the day.\n'
+        text = '\nThe programs on this system welcome you. 你好!\nMessage of the day.\n' * 100
         message = SimpleNamespace(partition='0', offset=42, key='aw==',
                                   value=base64.b64encode(text.encode('utf-8')).decode('ascii'))
         self.assertTrue(message.value.startswith('ClRoZSBwcm'))
@@ -39,14 +39,15 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(displayed['value'], text)
         self.assertNotIn('value_encoding', displayed)
 
-    def test_display_labels_binary_payload_preview(self):
+    def test_display_prints_complete_binary_payload_as_labeled_base64(self):
         raw = b'\xff\x00' * 100
         message = SimpleNamespace(partition='0', offset=42, key=None,
                                   value=base64.b64encode(raw).decode('ascii'))
         displayed = CONSUMER['display_message'](message)
         self.assertEqual(displayed['value_encoding'], 'base64')
-        self.assertTrue(displayed['value_truncated'])
-        self.assertEqual(displayed['value'], message.value[:64] + '...')
+        self.assertNotIn('value_truncated', displayed)
+        self.assertEqual(displayed['value'], message.value)
+        self.assertEqual(base64.b64decode(displayed['value']), raw)
 
     def setUp(self):
         self.oci = Mock()

@@ -63,7 +63,8 @@ also stops the run when the requested number of messages has been consumed.
 Ctrl-C/SIGTERM drains fetched batches and exits 130. Metrics are per this process,
 not the entire consumer group. Messages are printed as JSON lines to stdout;
 Keys remain base64; UTF-8 values show the complete decoded message text.
-Non-UTF-8 values show an explicitly labeled base64 preview (up to 64 characters).
+Non-UTF-8 values show their complete base64 representation, labeled as base64.
+Message values are never truncated.
 Runtime status and metrics go to stderr.
 Use --no-print-messages to consume without printing messages.
 
@@ -230,9 +231,7 @@ def display_message(message):
     try:
         result['value'] = raw.decode('utf-8')
     except UnicodeDecodeError:
-        value = message.value or ''
-        result.update(value=value[:64] + ('...' if len(value) > 64 else ''),
-                      value_encoding='base64', value_truncated=len(value) > 64)
+        result.update(value=message.value or '', value_encoding='base64')
     return result
 
 
@@ -575,7 +574,7 @@ def main(argv=None):
     parser.add_argument('--connect-timeout', type=positive_float, default=5)
     parser.add_argument('--request-timeout', type=positive_float, default=30)
     parser.add_argument('--print-messages', action=argparse.BooleanOptionalAction, default=True,
-                        help='print JSON messages with decoded UTF-8 values; binary values use a labeled base64 preview (default: enabled)')
+                        help='print full JSON messages with decoded UTF-8 values or complete labeled base64 for binary data (default: enabled)')
     parser.add_argument('--json-report', type=Path, help='save final metrics as JSON to this local file')
     parser.add_argument('--debug', action='store_true', help='enable SDK debug logging')
     parser.add_argument('--dry-run', action='store_true', help='show plan without importing OCI, authenticating or consuming')
