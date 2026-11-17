@@ -65,6 +65,10 @@ not the entire consumer group. Messages are printed as JSON lines to stdout;
 Keys remain base64; UTF-8 values show the complete decoded message text.
 Non-UTF-8 values show their complete base64 representation, labeled as base64.
 Message values are never truncated.
+--base64 enables base64 decoding for stdout (enabled by default). Use
+--no-base64 to print the full encoded value instead. Decode exactly one OCI
+transport layer; base64 text inside a message body is preserved as message data.
+Binary decoded bodies are printed as complete, labeled base64 values.
 Runtime status and metrics go to stderr.
 Use --no-print-messages to consume without printing messages.
 
@@ -129,6 +133,7 @@ USAGE_EXAMPLES = """Examples:
   ./runStreamConsumerDemo.sh <stream-name> --group-name new-group --cursor-type TRIM_HORIZON
   ./runStreamConsumerDemo.sh <stream-name> --group-name new-group --cursor-type AT_TIME --time 2026-11-09T00:00:00Z
   ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --max-messages 1000 --print-messages
+  ./runStreamConsumerDemo.sh <stream-name> --group-name my-group --base64
   ./runStreamConsumerDemo.sh --group-name my-group --endpoint private --dry-run
   ./runStreamConsumerDemo.sh <stream-name> --group-name kafka-group --endpoint private --api kafka-python
   ./runStreamConsumerDemo.sh <stream-name> --group-name kafka-group --api kafka-java --dry-run
@@ -224,14 +229,16 @@ def require_cursor(cursor):
     return cursor
 
 
-def display_message(message):
+def display_message(message, decode_base64=True):
     """Decode the SDK's base64 value for display without changing wire encoding."""
-    raw = base64.b64decode(message.value or '', validate=True)
     result = dict(partition=message.partition, offset=message.offset, key=message.key)
+    if not decode_base64:
+        return dict(result, value=message.value or '', value_encoding='base64')
+    raw = base64.b64decode(message.value or '', validate=True)
     try:
         result['value'] = raw.decode('utf-8')
     except UnicodeDecodeError:
-        result.update(value=message.value or '', value_encoding='base64')
+        result.update(value=base64.b64encode(raw).decode('ascii'), value_encoding='base64')
     return result
 
 
@@ -321,7 +328,8 @@ def worker(oci, client, args, state, stop, deadline, instance_name, output_lock)
                 if args.print_messages:
                     with output_lock:
                         for message in messages:
-                            print(json.dumps(display_message(message), ensure_ascii=False), flush=True)
+                            print(json.dumps(display_message(message, getattr(args, 'base64', True)),
+                                             ensure_ascii=False), flush=True)
                 state.record(messages, payload_bytes)
                 # Commit the returned cursor, including the last batch before stopping.
                 if messages:
@@ -405,7 +413,8 @@ def kafka_worker(kafka, client, args, state, stop, deadline, instance_name, outp
                 if args.print_messages:
                     with output_lock:
                         for message in messages:
-                            print(json.dumps(display_message(message), ensure_ascii=False), flush=True)
+                            print(json.dumps(display_message(message, getattr(args, 'base64', True)),
+                                             ensure_ascii=False), flush=True)
                 state.record(messages, payload_bytes)
                 if messages:
                     state.pacer.wait()  # Final commits also share the process-wide rate cap.
@@ -575,6 +584,8 @@ def main(argv=None):
     parser.add_argument('--request-timeout', type=positive_float, default=30)
     parser.add_argument('--print-messages', action=argparse.BooleanOptionalAction, default=True,
                         help='print full JSON messages with decoded UTF-8 values or complete labeled base64 for binary data (default: enabled)')
+    parser.add_argument('--base64', action=argparse.BooleanOptionalAction, default=True,
+                        help='decode base64 message values for stdout (default: enabled; --no-base64 prints full encoded values)')
     parser.add_argument('--json-report', type=Path, help='save final metrics as JSON to this local file')
     parser.add_argument('--debug', action='store_true', help='enable SDK debug logging')
     parser.add_argument('--dry-run', action='store_true', help='show plan without importing OCI, authenticating or consuming')
@@ -637,6 +648,7 @@ def main(argv=None):
         elif args.api == 'kafka-java':
             print('Java Kafka: native KafkaConsumer; bounded fetches; shared poll/commit pacing; JDK and built jar required')
         print('Commit: explicit after each processed batch; message output: ' + str(args.print_messages))
+        print(f'Base64 message decoding: {args.base64}')
         print('No SDK import, authentication, consumption, offset commits or report writes.')
         return 0
     try:

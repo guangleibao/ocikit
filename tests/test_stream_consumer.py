@@ -49,6 +49,25 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(displayed['value'], message.value)
         self.assertEqual(base64.b64decode(displayed['value']), raw)
 
+    def test_base64_flag_decodes_transport_layer_only(self):
+        text = 'Message of the day: Welcome! 你好\n' * 50
+        message = SimpleNamespace(partition='0', offset=42, key=None,
+                                  value=base64.b64encode(text.encode('utf-8')).decode('ascii'))
+        self.assertEqual(CONSUMER['display_message'](message, True)['value'], text)
+        self.assertEqual(CONSUMER['display_message'](message, False)['value'], message.value)
+        # Base64-looking body text is payload, not a second transport layer.
+        body = base64.b64encode(text.encode('utf-8'))
+        message.value = base64.b64encode(body).decode('ascii')
+        self.assertEqual(CONSUMER['display_message'](message, True)['value'], body.decode('ascii'))
+
+    def test_base64_flag_preserves_full_binary_decoded_payload(self):
+        raw = b'\xff\x00' * 100
+        message = SimpleNamespace(partition='0', offset=42, key=None,
+                                  value=base64.b64encode(raw).decode('ascii'))
+        displayed = CONSUMER['display_message'](message, True)
+        self.assertEqual(displayed['value_encoding'], 'base64')
+        self.assertEqual(base64.b64decode(displayed['value']), raw)
+
     def setUp(self):
         self.oci = Mock()
         self.client = Mock()
@@ -98,6 +117,31 @@ class ConsumerTests(unittest.TestCase):
         self.message.value = 'bad base64!'
         self.assertTrue(self.run_worker()['errors'])
         self.client.consumer_commit.assert_not_called()
+
+    def test_invalid_base64_transport_value_is_not_committed_when_flag_is_set(self):
+        self.args.base64 = True
+        self.args.print_messages = True
+        self.message.value = 'not valid base64!'
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(self.run_worker()['errors'])
+        self.client.consumer_commit.assert_not_called()
+
+    def test_base64_cli_flag_prints_decoded_full_message(self):
+        text = 'Message of the day: Hello! 你好\n' * 10
+        self.message.value = base64.b64encode(text.encode('utf-8')).decode('ascii')
+        stream = SimpleNamespace(name='events', id='stream', lifecycle_state='ACTIVE', stream_pool_id='pool')
+        self.oci.pagination.list_call_get_all_results.return_value.data = [stream]
+        self.oci.streaming.StreamClient.return_value = self.client
+        for flag in ('--base64', '--no-base64'):
+            with self.subTest(flag=flag), patch.dict('sys.modules', {'oci': self.oci}):
+                output = self.cli(['events', '--group-name', 'group', flag,
+                                   '--endpoint', 'https://messages.example.com', '--workers', '1',
+                                   '--max-messages', '1', '--request-rate', '1000'])
+            self.assertEqual(json.loads(output)['value'], text if flag == '--base64' else self.message.value)
+
+    def test_base64_flag_is_described_in_dry_run(self):
+        output = self.cli(['events', '--group-name', 'group', '--base64', '--dry-run'])
+        self.assertIn('Base64 message decoding: True', output)
 
     def test_commit_failure_stops_and_reports_uncommitted_messages(self):
         self.client.consumer_commit.side_effect = RuntimeError('commit failed')
